@@ -160,6 +160,18 @@ pub const Message = union(enum) {
     /// Renderer pushed a new frame, redraw this surface.
     redraw,
 
+    /// Release a message that was not delivered. A failed mailbox push leaves
+    /// ownership with the sender, including when the surface is shutting down.
+    pub fn deinit(self: Message) void {
+        switch (self) {
+            .clipboard_write => |value| value.req.deinit(),
+            .pwd_change => |value| value.deinit(),
+            .kitty_clipboard_read => |value| value.destroy(),
+            .kitty_clipboard_write => |value| value.destroy(),
+            else => {},
+        }
+    }
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
@@ -188,7 +200,8 @@ pub const Mailbox = struct {
     surface: *Surface,
     app: App.Mailbox,
 
-    /// Send a message to the surface.
+    /// Send a message to the surface. Returns zero if full, timed out, or the
+    /// surface is shutting down. On failure the caller still owns the message.
     pub fn push(
         self: Mailbox,
         msg: Message,
@@ -205,6 +218,60 @@ pub const Mailbox = struct {
         }, timeout);
     }
 };
+
+test "undelivered surface messages release owned payloads" {
+    const alloc = std.testing.allocator;
+    const data: []const u8 = "x" ** 1024;
+    // Exceed inline storage so the testing allocator checks each owned type.
+    const clipboard: Message = .{ .clipboard_write = .{
+        .clipboard_type = .standard,
+        .req = try Message.WriteReq.init(alloc, data),
+    } };
+    clipboard.deinit();
+    const pwd: Message = .{ .pwd_change = try Message.WriteReq.init(alloc, data) };
+    pwd.deinit();
+}
+
+test "undelivered Kitty clipboard messages release their arenas" {
+    inline for (.{ .kitty_clipboard_read, .kitty_clipboard_write }) |tag| {
+        const Request = switch (tag) {
+            .kitty_clipboard_read => apprt.ClipboardRequest.KittyRead,
+            .kitty_clipboard_write => apprt.ClipboardRequest.KittyWrite,
+            else => unreachable,
+        };
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const req = try alloc.create(Request);
+        const id = try alloc.dupe(u8, "clipboard request");
+        req.* = switch (tag) {
+            .kitty_clipboard_read => .{
+                .arena = arena,
+                .location = .standard,
+                .mimes = &.{},
+                .list = false,
+                .id = id,
+                .pw = "",
+                .name = "",
+                .granted = false,
+                .terminator = .st,
+            },
+            .kitty_clipboard_write => .{
+                .arena = arena,
+                .location = .standard,
+                .contents = &.{},
+                .id = id,
+                .pw = "",
+                .name = "",
+                .granted = false,
+                .terminator = .st,
+            },
+            else => unreachable,
+        };
+        const msg: Message = @unionInit(Message, @tagName(tag), req);
+        msg.deinit();
+    }
+}
 
 /// Context for new surface creation to determine inheritance behavior
 pub const NewSurfaceContext = enum(c_int) {

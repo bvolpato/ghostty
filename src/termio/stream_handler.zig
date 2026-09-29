@@ -136,7 +136,8 @@ pub const StreamHandler = struct {
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            if (self.surface_mailbox.push(msg, .{ .forever = {} }) == 0)
+                msg.deinit();
         }
     }
 

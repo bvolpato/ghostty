@@ -517,6 +517,8 @@ fn surfaceMessage(self: *App, surface: *Surface, msg: apprt.surface.Message) !vo
     // a simple linear search here.
     if (self.hasSurface(surface)) {
         try surface.handleMessage(msg);
+    } else {
+        msg.deinit();
     }
 
     // Window was not found, it probably quit before we handled the message.
@@ -585,7 +587,10 @@ pub const Mailbox = struct {
 
     /// Send a message to the surface.
     pub fn push(self: Mailbox, msg: Message, timeout: Queue.Timeout) Queue.Size {
-        const result = self.mailbox.push(global.io(), msg, timeout);
+        const result = self.mailbox.pushCancelable(global.io(), msg, timeout, switch (msg) {
+            .surface_message => |v| &v.surface.mailbox_canceled,
+            else => null,
+        });
 
         // Wake up our app loop
         self.rt_app.wakeup();
