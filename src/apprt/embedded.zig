@@ -4534,6 +4534,8 @@ pub const CAPI = struct {
 
                 var ps_buf: [256]u8 = undefined;
                 const ps_name: []const u8 = blk: {
+                    // CoreText-only identity; other font backends report "".
+                    if (comptime !font.options.backend.hasCoretext()) break :blk "";
                     const s = face.font.copyPostScriptName();
                     defer s.release();
                     break :blk s.cstring(&ps_buf, .utf8) orelse "";
@@ -4542,6 +4544,7 @@ pub const CAPI = struct {
                 const family: []const u8 = face.name(&family_buf) catch "";
                 var url_buf: [1024]u8 = undefined;
                 const url_path: ?[]const u8 = blk: {
+                    if (comptime !font.options.backend.hasCoretext()) break :blk null;
                     const url = face.font.copyAttribute(.url) orelse break :blk null;
                     defer url.release();
                     const path = url.copyPath() orelse break :blk null;
