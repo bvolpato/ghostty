@@ -740,6 +740,18 @@ const must_draw_from_app_thread =
     else
         false;
 
+/// cmux fork: like `must_draw_from_app_thread`, but decided per surface at
+/// runtime so one embedded runtime can host both renderer-thread surfaces
+/// and app-thread surfaces (the offscreen platform owns its GL context on
+/// the app thread).
+fn drawsFromAppThread(surface: *const apprt.Surface) bool {
+    if (comptime must_draw_from_app_thread) return true;
+    if (comptime @hasDecl(apprt.Surface, "mustDrawFromAppThread")) {
+        return surface.mustDrawFromAppThread();
+    }
+    return false;
+}
+
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
@@ -1074,6 +1086,9 @@ pub fn requestDrawWithPresentation(
     presentation: rendererpkg.FramePresentation,
 ) bool {
     if (comptime builtin.os.tag == .ios) return false;
+    // A queued tokened draw runs on the renderer thread, which has no GL
+    // context for app-thread surfaces.
+    if (drawsFromAppThread(self.surface)) return false;
     {
         self.pending_draw_presentation_mutex.lockUncancelable(global.io());
         defer self.pending_draw_presentation_mutex.unlock(global.io());
@@ -1787,7 +1802,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return .deferred_to_vsync;
 
-    if (must_draw_from_app_thread) {
+    if (drawsFromAppThread(self.surface)) {
         const pushed = self.app_mailbox.push(
             .{ .redraw_surface = .{ .surface = self.surface } },
             .{ .instant = {} },

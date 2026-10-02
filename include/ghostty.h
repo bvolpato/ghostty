@@ -69,6 +69,9 @@ typedef enum {
   GHOSTTY_PLATFORM_OPENGL = 3,
   GHOSTTY_PLATFORM_METAL_EXTERNAL = 4,
   GHOSTTY_PLATFORM_METAL_EXTERNAL_LEASED = 5,
+  // cmux fork: requires a libghostty built with -Dembedded-offscreen and the
+  // OpenGL renderer. Otherwise ghostty_surface_new returns NULL.
+  GHOSTTY_PLATFORM_OFFSCREEN = 6,
 } ghostty_platform_e;
 
 typedef enum {
@@ -533,12 +536,41 @@ typedef struct {
   ghostty_opengl_swap_buffers_cb swap_buffers;
 } ghostty_platform_opengl_s;
 
+// cmux fork: offscreen rendering with no native window, view, or
+// embedder-owned GL context. Ghostty owns a surfaceless EGL context (one per
+// drawing thread, shared by its offscreen surfaces), renders into its own
+// framebuffer, and delivers each frame through
+// ghostty_surface_set_frame_callback or ghostty_surface_set_dmabuf_callback.
+//
+// Offscreen surfaces draw on the app thread: when a frame is due, Ghostty
+// emits GHOSTTY_ACTION_RENDER and the embedder calls ghostty_surface_draw,
+// which delivers the frame before it returns. Create, draw, and free
+// offscreen surfaces on that one thread. Terminal IO is independent: combine
+// it with GHOSTTY_SURFACE_IO_MANUAL_MIRROR to render an embedder-owned PTY.
+//
+// The EGL context is created on first use and is never destroyed; it lives
+// until the drawing thread or the process exits. On Linux, link the final
+// executable with -lEGL (libghostty references the egl* symbols but does not
+// load libEGL itself). On Windows, Mesa's libEGL.dll is loaded at runtime from
+// cmux_mesa\ next to the executable, then from the default search path.
+//
+// width/height are the initial size in pixels (0 keeps the default) and
+// scale the initial content scale (<= 0 keeps scale_factor). Use
+// ghostty_surface_set_size and ghostty_surface_set_content_scale to change
+// them later.
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  double scale;
+} ghostty_platform_offscreen_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
   ghostty_platform_opengl_s opengl;
   ghostty_platform_metal_external_s metal_external;
   ghostty_platform_metal_external_leased_s metal_external_leased;
+  ghostty_platform_offscreen_s offscreen;
 } ghostty_platform_u;
 
 typedef enum {
@@ -1392,6 +1424,55 @@ GHOSTTY_API float ghostty_surface_font_size(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_font_size_adjusted(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
+
+// cmux fork: offscreen platform frame delivery. `frame` is borrowed and valid
+// only during the call. Callbacks run on the thread that draws the surface
+// (inside ghostty_surface_draw). Other platforms ignore these registrations.
+// Call the setters on that same thread. A callback must not call
+// ghostty_surface_draw, ghostty_surface_free, or either setter for the surface
+// that is being drawn: the draw holds renderer locks and still uses the
+// surface after the callback returns.
+typedef void (*ghostty_frame_callback_cb)(void* userdata, const void* frame);
+
+// One CPU-readback frame: RGBA8, rows bottom-up (OpenGL order), `stride`
+// bytes per row. Passed as the `frame` argument of the frame callback.
+// `data` is reused for the next frame: copy it before the callback returns.
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride;
+  const uint8_t* data;
+} ghostty_offscreen_frame_s;
+
+// Delivers each frame as a ghostty_offscreen_frame_s*. NULL stops delivery.
+GHOSTTY_API void ghostty_surface_set_frame_callback(ghostty_surface_t,
+                                                    ghostty_frame_callback_cb,
+                                                    void* userdata);
+
+// One dmabuf-exported frame (Linux): a single RGBA plane. The callback owns
+// `fd` and must close it. The DRM format modifier is split into hi/lo halves.
+// Every frame of a surface exports the same GPU buffer (a new fd each time),
+// and the next ghostty_surface_draw of that surface overwrites it. The
+// rendering is complete (glFinish) before the callback runs.
+typedef struct {
+  int32_t fd;
+  uint32_t fourcc;
+  uint32_t num_planes;
+  uint32_t stride;
+  uint32_t offset;
+  uint32_t modifier_hi;
+  uint32_t modifier_lo;
+  uint32_t width;
+  uint32_t height;
+} ghostty_dmabuf_frame_s;
+
+// Linux only: when set, each frame is exported as a dmabuf and delivered as a
+// ghostty_dmabuf_frame_s* instead of a CPU readback. Needs a driver with
+// EGL_MESA_image_dma_buf_export; when export fails the frame goes to the
+// frame callback instead. NULL goes back to CPU readback.
+GHOSTTY_API void ghostty_surface_set_dmabuf_callback(ghostty_surface_t,
+                                                     ghostty_frame_callback_cb,
+                                                     void* userdata);
 // cmux fork: delete when upstream exposes a synchronous render tick for
 // embedders that drive rendering from a platform display callback.
 GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
