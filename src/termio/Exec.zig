@@ -1588,7 +1588,8 @@ test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
         "/Applications/cmux.app/Contents/Resources/bin",
         env.get("GHOSTTY_BIN_DIR").?,
     );
-    // PATH entries are joined with the platform delimiter (";" on Windows).
+    // The existing PATH value is kept as-is (here one entry, even on
+    // Windows); the bin dir is appended with the platform delimiter.
     try testing.expectEqualStrings(
         "/usr/bin:/bin" ++ .{std.fs.path.delimiter} ++ "/Applications/cmux.app/Contents/Resources/bin",
         env.get("PATH").?,
