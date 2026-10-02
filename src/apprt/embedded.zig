@@ -727,6 +727,16 @@ pub const OffscreenDmabufFrame = extern struct {
     height: u32,
 };
 
+/// Every field of the Zig mirror has the same offset and size as in C.
+fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
+    try std.testing.expectEqual(@sizeOf(C), @sizeOf(Zig));
+    try std.testing.expectEqual(@alignOf(C), @alignOf(Zig));
+    inline for (@typeInfo(Zig).@"struct".fields) |field| {
+        try std.testing.expectEqual(@offsetOf(C, field.name), @offsetOf(Zig, field.name));
+        try std.testing.expectEqual(@sizeOf(@FieldType(C, field.name)), @sizeOf(field.type));
+    }
+}
+
 test "embedded offscreen platform follows the build option and C ABI" {
     const c = @import("ghostty.h");
     try std.testing.expectEqual(
@@ -740,15 +750,14 @@ test "embedded offscreen platform follows the build option and C ABI" {
         @sizeOf(@FieldType(Platform.C, "offscreen")),
         @sizeOf(c.ghostty_platform_offscreen_s),
     );
-    try std.testing.expectEqual(@sizeOf(OffscreenFrame), @sizeOf(c.ghostty_offscreen_frame_s));
-    try std.testing.expectEqual(
-        @offsetOf(OffscreenFrame, "data"),
-        @offsetOf(c.ghostty_offscreen_frame_s, "data"),
-    );
-    try std.testing.expectEqual(@sizeOf(OffscreenDmabufFrame), @sizeOf(c.ghostty_dmabuf_frame_s));
-    try std.testing.expectEqual(
-        @offsetOf(OffscreenDmabufFrame, "height"),
-        @offsetOf(c.ghostty_dmabuf_frame_s, "height"),
+    try std.testing.expectEqual(@alignOf(Platform.C), @alignOf(c.ghostty_platform_u));
+    try expectSameLayout(@FieldType(Platform.C, "offscreen"), c.ghostty_platform_offscreen_s);
+    try expectSameLayout(OffscreenFrame, c.ghostty_offscreen_frame_s);
+    try expectSameLayout(OffscreenDmabufFrame, c.ghostty_dmabuf_frame_s);
+    // The dmabuf frame the renderer builds is the same layout again.
+    try expectSameLayout(
+        @import("../renderer/opengl/EglContext.zig").DmabufFrame,
+        c.ghostty_dmabuf_frame_s,
     );
 
     var c_platform: Platform.C = undefined;
@@ -792,6 +801,19 @@ test "embedded offscreen surface geometry and app-thread drawing" {
     surface.applyOffscreenInitialGeometry();
     try std.testing.expectEqual(@as(u32, 800), surface.size.width);
     try std.testing.expectEqual(@as(f32, 1), surface.content_scale.x);
+
+    // Non-finite scales keep the default; scales below 1 clamp to 1.
+    surface.content_scale = .{ .x = 2, .y = 2 };
+    inline for (.{ std.math.inf(f64), std.math.nan(f64) }) |bad| {
+        c_platform.offscreen = .{ .width = 0, .height = 0, .scale = bad };
+        surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+        surface.applyOffscreenInitialGeometry();
+        try std.testing.expectEqual(@as(f32, 2), surface.content_scale.x);
+    }
+    c_platform.offscreen = .{ .width = 0, .height = 0, .scale = 0.5 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(f32, 1), surface.content_scale.y);
 
     // Callbacks are plain registrations; clearing them stops delivery.
     const Cb = struct {
@@ -1475,10 +1497,13 @@ pub const Surface = struct {
         if (config.width > 0 and config.height > 0) {
             self.size = .{ .width = config.width, .height = config.height };
         }
-        if (config.scale > 0) {
+        // Same policy as updateContentScale: the embedder can pass garbage,
+        // and fractional scales below 1 are not supported.
+        if (std.math.isFinite(config.scale) and config.scale > 0) {
+            const scale = @max(1, config.scale);
             self.content_scale = .{
-                .x = @floatCast(config.scale),
-                .y = @floatCast(config.scale),
+                .x = @floatCast(scale),
+                .y = @floatCast(scale),
             };
         }
     }
