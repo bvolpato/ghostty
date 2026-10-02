@@ -590,7 +590,8 @@ const Subprocess = struct {
     const c = @cImport({
         @cInclude("errno.h");
         @cInclude("signal.h");
-        @cInclude("sys/ioctl.h");
+        // MinGW has no sys/ioctl.h; the ioctl users are POSIX-only.
+        if (builtin.os.tag != .windows) @cInclude("sys/ioctl.h");
         @cInclude("unistd.h");
     });
 
@@ -1587,8 +1588,9 @@ test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
         "/Applications/cmux.app/Contents/Resources/bin",
         env.get("GHOSTTY_BIN_DIR").?,
     );
+    // PATH entries are joined with the platform delimiter (";" on Windows).
     try testing.expectEqualStrings(
-        "/usr/bin:/bin:/Applications/cmux.app/Contents/Resources/bin",
+        "/usr/bin:/bin" ++ .{std.fs.path.delimiter} ++ "/Applications/cmux.app/Contents/Resources/bin",
         env.get("PATH").?,
     );
 }
@@ -2187,7 +2189,7 @@ pub const ReadThread = struct {
             log.err("error creating read event err={}", .{windows.GetLastError()});
             return;
         };
-        defer _ = windows.CloseHandle(read_event);
+        defer _ = windows.exp.kernel32.CloseHandle(read_event);
 
         var buf: [1024]u8 = undefined;
         while (true) {
@@ -2195,7 +2197,7 @@ pub const ReadThread = struct {
             // race where teardown cancels before ReadFile becomes pending.
             if (windowsQuitRequested(quit)) return;
 
-            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+            if (windows.exp.kernel32.ResetEvent(read_event) == windows.FALSE) {
                 log.err("error resetting read event err={}", .{windows.GetLastError()});
                 return;
             }
@@ -2203,7 +2205,7 @@ pub const ReadThread = struct {
             var overlapped = std.mem.zeroes(windows.OVERLAPPED);
             overlapped.hEvent = read_event;
 
-            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == windows.FALSE) {
                 const err = windows.GetLastError();
                 switch (err) {
                     .IO_PENDING => {},
@@ -2226,7 +2228,7 @@ pub const ReadThread = struct {
                 // Cancel this exact request. The main IO thread also cancels
                 // all requests, but it may have done so before this ReadFile
                 // was submitted.
-                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == windows.FALSE) {
                     switch (windows.GetLastError()) {
                         .NOT_FOUND => {},
                         else => |err| log.warn("error cancelling submitted read err={}", .{err}),
@@ -2250,7 +2252,7 @@ pub const ReadThread = struct {
     /// broken quit pipe also stops the reader so teardown cannot deadlock.
     fn windowsQuitRequested(quit: posix.fd_t) bool {
         var quit_bytes: windows.DWORD = 0;
-        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
             log.err("quit pipe reader error err={}", .{windows.GetLastError()});
             return true;
         }
@@ -2275,7 +2277,7 @@ pub const ReadThread = struct {
             overlapped,
             &n,
             windows.TRUE,
-        ) == 0) {
+        ) == windows.FALSE) {
             const err = windows.GetLastError();
             switch (err) {
                 .OPERATION_ABORTED => {
