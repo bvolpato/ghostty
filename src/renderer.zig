@@ -237,6 +237,9 @@ test {
     _ = frame_lease;
     _ = external_frame;
     _ = shadertoy;
+    // cmux fork: the offscreen EGL helpers have pure tests that run on every
+    // host, even when -Dembedded-offscreen is off.
+    _ = @import("renderer/opengl/EglContext.zig");
     _ = size;
     _ = Thread;
     _ = State;

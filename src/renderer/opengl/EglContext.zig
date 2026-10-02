@@ -403,8 +403,11 @@ pub const EglContext = struct {
             return error.EglExportFailed;
         }
 
+        // Only a single-plane layout fits DmabufFrame. Close every exported
+        // fd before failing so the caller can fall back without a leak.
+        const fd = try takeSinglePlaneFd(num_planes, &fds);
         return .{
-            .fd = fds[0],
+            .fd = fd,
             .fourcc = @bitCast(fourcc),
             .num_planes = @intCast(num_planes),
             .stride = @bitCast(strides[0]),
@@ -422,3 +425,62 @@ pub const EglContext = struct {
         self.* = .{};
     }
 };
+
+/// Return the single exported plane fd, or close every valid fd and fail when
+/// the export is not exactly one plane with a valid fd. On success the caller
+/// owns the returned fd.
+fn takeSinglePlaneFd(num_planes: EGLint, fds: *const [4]EGLint) !i32 {
+    if (num_planes == 1 and fds[0] >= 0) {
+        for (fds[1..]) |fd| if (fd >= 0) closeFd(fd);
+        return fds[0];
+    }
+    for (fds) |fd| if (fd >= 0) closeFd(fd);
+    log.warn("dmabuf export is not single-plane num_planes={}", .{num_planes});
+    return error.EglExportUnsupportedLayout;
+}
+
+fn closeFd(fd: EGLint) void {
+    if (comptime is_windows) return;
+    _ = std.posix.system.close(fd);
+}
+
+test "dmabuf export keeps one plane and closes every other fd" {
+    if (comptime is_windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const posix = std.posix;
+
+    const isOpen = struct {
+        fn f(fd: posix.fd_t) bool {
+            return posix.system.fcntl(fd, posix.F.GETFD, @as(usize, 0)) != -1;
+        }
+    }.f;
+
+    var p1: [2]posix.fd_t = undefined;
+    var p2: [2]posix.fd_t = undefined;
+    try testing.expectEqual(@as(c_int, 0), posix.system.pipe(&p1));
+    try testing.expectEqual(@as(c_int, 0), posix.system.pipe(&p2));
+
+    // Multi-plane: every fd is closed and the export is rejected.
+    var multi: [4]EGLint = .{ p1[0], p1[1], -1, -1 };
+    try testing.expectError(
+        error.EglExportUnsupportedLayout,
+        takeSinglePlaneFd(2, &multi),
+    );
+    try testing.expect(!isOpen(p1[0]));
+    try testing.expect(!isOpen(p1[1]));
+
+    // Invalid fd: rejected without touching anything else.
+    var invalid: [4]EGLint = .{ -1, -1, -1, -1 };
+    try testing.expectError(
+        error.EglExportUnsupportedLayout,
+        takeSinglePlaneFd(1, &invalid),
+    );
+
+    // Single plane: plane 0 is returned open; stray extra fds are closed.
+    var single: [4]EGLint = .{ p2[0], p2[1], -1, -1 };
+    const fd = try takeSinglePlaneFd(1, &single);
+    try testing.expectEqual(p2[0], fd);
+    try testing.expect(isOpen(p2[0]));
+    try testing.expect(!isOpen(p2[1]));
+    _ = posix.system.close(p2[0]);
+}
