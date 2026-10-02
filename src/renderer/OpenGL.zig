@@ -69,6 +69,211 @@ fn leaveEmbedded() void {
     embedded_state = null;
 }
 
+/// cmux fork: the embedded `offscreen` platform (`-Dembedded-offscreen`).
+/// Ghostty owns a surfaceless EGL context and offscreen surfaces draw on the
+/// app thread (see apprt.embedded.Platform.Offscreen). None of this is
+/// analyzed when the option is off.
+const offscreen_enabled = is_embedded and build_config.embedded_offscreen;
+const egl = if (offscreen_enabled) @import("opengl/EglContext.zig") else struct {};
+
+/// The EGL context of the thread that draws offscreen surfaces (the app
+/// thread). Every offscreen surface drawn on that thread shares it: GL object
+/// names belong to a context, so a context per surface left only the newest
+/// one current and older surfaces drew with foreign object names (blank or
+/// partly transparent frames). It lives for the rest of the process.
+threadlocal var egl_offscreen: if (offscreen_enabled) ?egl.EglContext else void =
+    if (offscreen_enabled) null else {};
+
+/// Make the thread's offscreen context current, creating it and loading GL
+/// on first use. Another EGL/GL context current on this thread is replaced.
+fn offscreenMakeCurrent() !void {
+    if (egl_offscreen) |*ctx| return ctx.makeCurrent();
+    var ctx = try egl.EglContext.init();
+    errdefer ctx.deinit();
+    try ctx.makeCurrent();
+    errdefer ctx.clearCurrent();
+    try prepareContext(&egl.eglGetProcAddress);
+    egl_offscreen = ctx;
+}
+
+fn isOffscreenSurface(surface: *const apprt.Surface) bool {
+    if (comptime !offscreen_enabled) return false;
+    return surface.isOffscreen();
+}
+
+/// Per-renderer offscreen presentation state.
+const Offscreen = struct {
+    alloc: Allocator,
+    surface: *apprt.Surface,
+
+    /// Reusable CPU readback buffer (RGBA8). Grows on demand.
+    readback: []u8 = &.{},
+
+    /// Exportable texture + FBO for dmabuf presentation. The renderer draws
+    /// into a renderbuffer target, which is blitted here so it can be
+    /// exported as an EGLImage. Recreated when the size changes.
+    dmabuf_tex: ?gl.Texture = null,
+    dmabuf_fbo: ?gl.Framebuffer = null,
+    dmabuf_width: usize = 0,
+    dmabuf_height: usize = 0,
+
+    /// Deliver a rendered target to the embedder: as a dmabuf when a dmabuf
+    /// callback is registered and export works, otherwise as a CPU readback.
+    fn present(self: *Offscreen, target: Target) !void {
+        if (target.width == 0 or target.height == 0) return;
+        if (self.surface.offscreen_dmabuf_callback != null) {
+            if (self.presentDmabuf(target)) |_| return else |err| {
+                // Drivers without EGL_MESA_image_dma_buf_export (llvmpipe)
+                // still get frames through the CPU path.
+                log.warn("dmabuf export failed, using CPU readback err={}", .{err});
+            }
+        }
+        try self.presentCpu(target);
+    }
+
+    /// Read the target back as RGBA8 (bottom-up, GL order) and hand it to
+    /// the frame callback. Works without a GPU.
+    fn presentCpu(self: *Offscreen, target: Target) !void {
+        const callback = self.surface.offscreen_frame_callback orelse return;
+        const stride = target.width * 4;
+        const len = stride * target.height;
+        if (self.readback.len < len) {
+            if (self.readback.len > 0) self.alloc.free(self.readback);
+            self.readback = &.{};
+            self.readback = try self.alloc.alloc(u8, len);
+        }
+
+        {
+            const binding = try target.framebuffer.bind(.read);
+            defer binding.unbind();
+            gl.glad.context.ReadPixels.?(
+                0,
+                0,
+                @intCast(target.width),
+                @intCast(target.height),
+                gl.c.GL_RGBA,
+                gl.c.GL_UNSIGNED_BYTE,
+                self.readback.ptr,
+            );
+        }
+
+        const frame: apprt.embedded.OffscreenFrame = .{
+            .width = @intCast(target.width),
+            .height = @intCast(target.height),
+            .stride = @intCast(stride),
+            .data = self.readback.ptr,
+        };
+        callback(self.surface.offscreen_frame_userdata, @ptrCast(&frame));
+    }
+
+    /// Ensure the exportable texture-backed FBO matches the target size.
+    fn ensureDmabufTarget(self: *Offscreen, width: usize, height: usize) !void {
+        if (self.dmabuf_tex != null and
+            self.dmabuf_width == width and
+            self.dmabuf_height == height) return;
+        if (self.dmabuf_fbo) |f| f.destroy();
+        if (self.dmabuf_tex) |t| t.destroy();
+        self.dmabuf_fbo = null;
+        self.dmabuf_tex = null;
+
+        const tex = try gl.Texture.create();
+        errdefer tex.destroy();
+        {
+            const binding = try tex.bind(.@"2D");
+            defer binding.unbind();
+            // Plain RGBA8, not sRGB: the blit runs with GL_FRAMEBUFFER_SRGB
+            // off so the encoded bytes copy verbatim, and linear RGBA8 maps
+            // to a widely importable DRM fourcc.
+            try binding.image2D(0, .rgba, @intCast(width), @intCast(height), .rgba, .UnsignedByte, null);
+            try binding.parameter(.MinFilter, @as(gl.c.GLint, gl.c.GL_NEAREST));
+            try binding.parameter(.MagFilter, @as(gl.c.GLint, gl.c.GL_NEAREST));
+            try binding.parameter(.MaxLevel, @as(gl.c.GLint, 0));
+            try binding.parameter(.WrapS, @as(gl.c.GLint, gl.c.GL_CLAMP_TO_EDGE));
+            try binding.parameter(.WrapT, @as(gl.c.GLint, gl.c.GL_CLAMP_TO_EDGE));
+        }
+
+        const fbo = try gl.Framebuffer.create();
+        errdefer fbo.destroy();
+        {
+            const binding = try fbo.bind(.framebuffer);
+            defer binding.unbind();
+            try binding.texture2D(.color0, .@"2D", tex, 0);
+        }
+
+        self.dmabuf_tex = tex;
+        self.dmabuf_fbo = fbo;
+        self.dmabuf_width = width;
+        self.dmabuf_height = height;
+    }
+
+    /// Blit the target into the exportable texture and hand it to the dmabuf
+    /// callback (Linux, needs EGL_MESA_image_dma_buf_export).
+    fn presentDmabuf(self: *Offscreen, target: Target) !void {
+        if (comptime builtin.os.tag != .linux) return error.DmabufUnsupported;
+        const callback = self.surface.offscreen_dmabuf_callback orelse
+            return error.DmabufUnsupported;
+        try self.ensureDmabufTarget(target.width, target.height);
+
+        {
+            try gl.disable(gl.c.GL_FRAMEBUFFER_SRGB);
+            defer gl.enable(gl.c.GL_FRAMEBUFFER_SRGB) catch |err| {
+                log.err("error re-enabling GL_FRAMEBUFFER_SRGB err={}", .{err});
+            };
+            const read = try target.framebuffer.bind(.read);
+            defer read.unbind();
+            const draw = try self.dmabuf_fbo.?.bind(.draw);
+            defer draw.unbind();
+            // Straight copy: the export keeps GL bottom-up order, the same
+            // orientation as the CPU readback.
+            gl.glad.context.BlitFramebuffer.?(
+                0,
+                0,
+                @intCast(target.width),
+                @intCast(target.height),
+                0,
+                0,
+                @intCast(target.width),
+                @intCast(target.height),
+                gl.c.GL_COLOR_BUFFER_BIT,
+                gl.c.GL_NEAREST,
+            );
+        }
+        // The importer may read the buffer as soon as it has the fd.
+        gl.finish();
+
+        const ctx = &(egl_offscreen orelse return error.OpenGLContextNotCurrent);
+        const exported = try ctx.exportTexture(
+            self.dmabuf_tex.?.id,
+            @intCast(target.width),
+            @intCast(target.height),
+        );
+        const frame: apprt.embedded.OffscreenDmabufFrame = .{
+            .fd = exported.fd,
+            .fourcc = exported.fourcc,
+            .num_planes = exported.num_planes,
+            .stride = exported.stride,
+            .offset = exported.offset,
+            .modifier_hi = exported.modifier_hi,
+            .modifier_lo = exported.modifier_lo,
+            .width = exported.width,
+            .height = exported.height,
+        };
+        // The callback owns frame.fd from here on.
+        callback(self.surface.offscreen_dmabuf_userdata, @ptrCast(&frame));
+    }
+
+    fn deinit(self: *Offscreen) void {
+        // GL objects belong to the shared context, which must be current.
+        offscreenMakeCurrent() catch |err| {
+            log.warn("offscreen context unavailable during teardown err={}", .{err});
+        };
+        if (self.dmabuf_fbo) |f| f.destroy();
+        if (self.dmabuf_tex) |t| t.destroy();
+        if (self.readback.len > 0) self.alloc.free(self.readback);
+        self.* = undefined;
+    }
+};
+
 /// We require at least OpenGL 4.3
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
@@ -81,17 +286,30 @@ blending: configpkg.Config.AlphaBlending,
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
+/// cmux fork: set when this renderer draws an offscreen-platform surface.
+offscreen: if (offscreen_enabled) ?Offscreen else void =
+    if (offscreen_enabled) null else {},
+
 /// NOTE: This is an error{}!OpenGL instead of just OpenGL for parity with
 ///       Metal, since it needs to be fallible so does this, even though it
 ///       can't actually fail.
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
-    return .{
+    var result: OpenGL = .{
         .alloc = alloc,
         .blending = opts.config.blending,
     };
+    if (comptime offscreen_enabled) {
+        if (isOffscreenSurface(opts.rt_surface)) {
+            result.offscreen = .{ .alloc = alloc, .surface = opts.rt_surface };
+        }
+    }
+    return result;
 }
 
 pub fn deinit(self: *OpenGL) void {
+    if (comptime offscreen_enabled) {
+        if (self.offscreen) |*o| o.deinit();
+    }
     if (comptime is_embedded) leaveEmbedded();
     self.* = undefined;
 }
@@ -205,6 +423,13 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
         => try prepareContext(null),
 
         apprt.embedded => {
+            // Offscreen: create (or reuse) the app thread's EGL context and
+            // keep it current. This runs before Renderer.init creates GL
+            // objects, and offscreen frames are drawn on this same thread.
+            if (comptime offscreen_enabled) {
+                if (isOffscreenSurface(surface)) return offscreenMakeCurrent();
+            }
+
             try enterEmbedded(surface);
             errdefer leaveEmbedded();
             try prepareContext(&embeddedGetProcAddress);
@@ -225,7 +450,8 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 /// thread for final main thread setup requirements.
 pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     _ = self;
-    _ = surface;
+    // Offscreen keeps its context current on the app thread, which draws.
+    if (isOffscreenSurface(surface)) return;
     if (comptime is_embedded) leaveEmbedded();
 }
 
@@ -244,6 +470,10 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
         },
 
         apprt.embedded => {
+            // Offscreen surfaces draw on the app thread; the renderer thread
+            // only prepares frame data and must not touch GL.
+            if (isOffscreenSurface(surface)) return;
+
             try enterEmbedded(surface);
             errdefer leaveEmbedded();
             try prepareContext(&embeddedGetProcAddress);
@@ -291,7 +521,25 @@ pub fn displayRealized(self: *const OpenGL) !void {
 /// of the long-lived renderer context. OpenGL does not update the viewport
 /// when a drawable changes size, so synchronize it before every frame.
 pub fn drawFrameStart(self: *OpenGL) void {
-    _ = self;
+    if (comptime offscreen_enabled) {
+        if (self.offscreen) |o| {
+            // Another context may have been made current on this thread since
+            // the last frame (e.g. by the host). A surfaceless context also
+            // starts with a 0x0 viewport.
+            offscreenMakeCurrent() catch |err| {
+                log.err("error making offscreen context current err={}", .{err});
+                return;
+            };
+            const size = o.surface.getSize() catch return;
+            gl.glad.context.Viewport.?(
+                0,
+                0,
+                @intCast(size.width),
+                @intCast(size.height),
+            );
+            return;
+        }
+    }
     if (comptime is_embedded) {
         const state = embedded_state orelse return;
         const size = state.surface.getSize() catch |err| {
@@ -328,7 +576,13 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
-    _ = self;
+    if (comptime offscreen_enabled) {
+        // No drawable to query; the embedder sets the size.
+        if (self.offscreen) |o| {
+            const size = try o.surface.getSize();
+            return .{ .width = size.width, .height = size.height };
+        }
+    }
     if (comptime is_embedded) {
         const state = embedded_state orelse return error.OpenGLContextNotCurrent;
         const size = try state.surface.getSize();
@@ -353,6 +607,14 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
 
 /// Present the provided target.
 pub fn present(self: *OpenGL, target: Target) !void {
+    if (comptime offscreen_enabled) {
+        // Offscreen has no default framebuffer; deliver the target instead.
+        if (self.offscreen) |*o| {
+            try o.present(target);
+            self.last_target = target;
+            return;
+        }
+    }
     var ops: PresentationOps = .{};
     return presentWithOps(self, target, &ops);
 }

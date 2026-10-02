@@ -25,6 +25,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const build_config = @import("../build_config.zig");
 const String = @import("../main_c.zig").String;
 
 const log = std.log.scoped(.embedded_window);
@@ -390,6 +391,7 @@ pub const Platform = union(PlatformTag) {
     opengl: OpenGL,
     metal_external: MetalExternal,
     metal_external_leased: MetalExternalLeased,
+    offscreen: Offscreen,
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
@@ -442,6 +444,35 @@ pub const Platform = union(PlatformTag) {
         swap_buffers: *const fn (?*anyopaque) callconv(.c) void,
     };
 
+    /// cmux fork: offscreen rendering with no native window, view, or
+    /// embedder-owned GL context. Ghostty owns a surfaceless EGL context
+    /// (shared by every offscreen surface drawn on the same thread), renders
+    /// into its own framebuffer, and hands each finished frame to the
+    /// embedder through `ghostty_surface_set_frame_callback` (CPU RGBA
+    /// readback) or `ghostty_surface_set_dmabuf_callback` (Linux dmabuf).
+    ///
+    /// Offscreen surfaces draw on the app thread: the renderer thread asks
+    /// for a redraw with the RENDER action and the embedder answers with
+    /// `ghostty_surface_draw`, which delivers the frame synchronously. Create,
+    /// draw, and free offscreen surfaces on that one thread.
+    ///
+    /// This only affects rendering. Terminal IO is still chosen by
+    /// `ghostty_surface_config_s.io_mode`, so an offscreen surface can mirror
+    /// an embedder-owned PTY (GHOSTTY_SURFACE_IO_MANUAL_MIRROR).
+    ///
+    /// Compiled only with `-Dembedded-offscreen`; otherwise surface creation
+    /// with this tag fails with error.UnsupportedPlatform.
+    pub const Offscreen = if (build_config.embedded_offscreen) struct {
+        /// Initial size in pixels. Zero keeps the default; the embedder can
+        /// change it at any time with ghostty_surface_set_size.
+        width: u32,
+        height: u32,
+
+        /// Initial content scale. Zero or negative keeps
+        /// ghostty_surface_config_s.scale_factor.
+        scale: f64,
+    } else void;
+
     // The C ABI compatible version of this union. The tag is expected
     // to be stored elsewhere.
     pub const C = extern union {
@@ -477,6 +508,12 @@ pub const Platform = union(PlatformTag) {
             clear_current: ?*const fn (?*anyopaque) callconv(.c) void,
             get_proc_address: ?*const fn (?*anyopaque, [*:0]const u8) callconv(.c) ?*anyopaque,
             swap_buffers: ?*const fn (?*anyopaque) callconv(.c) void,
+        },
+
+        offscreen: extern struct {
+            width: u32,
+            height: u32,
+            scale: f64,
         },
     };
 
@@ -530,6 +567,12 @@ pub const Platform = union(PlatformTag) {
                         return error.OpenGLSwapBuffersMustBeSet,
                 } };
             },
+
+            .offscreen => if (Offscreen != void) .{ .offscreen = .{
+                .width = c_platform.offscreen.width,
+                .height = c_platform.offscreen.height,
+                .scale = c_platform.offscreen.scale,
+            } } else error.UnsupportedPlatform,
         };
     }
 };
@@ -543,12 +586,15 @@ pub const PlatformTag = enum(c_int) {
     opengl = 3,
     metal_external = 4,
     metal_external_leased = 5,
+    offscreen = 6,
 };
 
 comptime {
     if (@intFromEnum(PlatformTag.metal_external) != 4 or
         @intFromEnum(PlatformTag.metal_external_leased) != 5)
         @compileError("external Metal platform tags changed ABI");
+    if (@intFromEnum(PlatformTag.offscreen) != 6)
+        @compileError("offscreen platform tag changed ABI");
     if (@sizeOf(ExternalFrame) != 40)
         @compileError("external Metal frame changed ABI");
     // OpenGL remains the largest platform variant, so adding the leased
@@ -648,6 +694,118 @@ test "embedded leased metal platform preserves ABI and validates callback" {
         @sizeOf(ExternalFrame),
         @sizeOf(c.ghostty_metal_external_frame_s),
     );
+}
+
+/// cmux fork: callback type for offscreen frame delivery. The second argument
+/// is a borrowed `*const OffscreenFrame` or `*const OffscreenDmabufFrame`,
+/// valid only during the call.
+pub const OffscreenFrameCallback = *const fn (
+    userdata: ?*anyopaque,
+    frame: ?*const anyopaque,
+) callconv(.c) void;
+
+/// cmux fork: one CPU-readback offscreen frame (ghostty_offscreen_frame_s).
+/// RGBA8, rows bottom-up (OpenGL order), `stride` bytes per row.
+pub const OffscreenFrame = extern struct {
+    width: u32,
+    height: u32,
+    stride: u32,
+    data: [*]const u8,
+};
+
+/// cmux fork: one dmabuf-exported offscreen frame (ghostty_dmabuf_frame_s).
+/// Single plane; the DRM format modifier is split into hi/lo halves.
+pub const OffscreenDmabufFrame = extern struct {
+    fd: i32,
+    fourcc: u32,
+    num_planes: u32,
+    stride: u32,
+    offset: u32,
+    modifier_hi: u32,
+    modifier_lo: u32,
+    width: u32,
+    height: u32,
+};
+
+test "embedded offscreen platform follows the build option and C ABI" {
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(c_int, @intFromEnum(PlatformTag.offscreen)),
+        @as(c_int, c.GHOSTTY_PLATFORM_OFFSCREEN),
+    );
+    // The new union member must not grow ghostty_surface_config_s.
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(Platform.C));
+    try std.testing.expectEqual(@sizeOf(Platform.C), @sizeOf(c.ghostty_platform_u));
+    try std.testing.expectEqual(
+        @sizeOf(@FieldType(Platform.C, "offscreen")),
+        @sizeOf(c.ghostty_platform_offscreen_s),
+    );
+    try std.testing.expectEqual(@sizeOf(OffscreenFrame), @sizeOf(c.ghostty_offscreen_frame_s));
+    try std.testing.expectEqual(
+        @offsetOf(OffscreenFrame, "data"),
+        @offsetOf(c.ghostty_offscreen_frame_s, "data"),
+    );
+    try std.testing.expectEqual(@sizeOf(OffscreenDmabufFrame), @sizeOf(c.ghostty_dmabuf_frame_s));
+    try std.testing.expectEqual(
+        @offsetOf(OffscreenDmabufFrame, "height"),
+        @offsetOf(c.ghostty_dmabuf_frame_s, "height"),
+    );
+
+    var c_platform: Platform.C = undefined;
+    c_platform.offscreen = .{ .width = 640, .height = 480, .scale = 2 };
+    const result = Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    if (comptime build_config.embedded_offscreen) {
+        const platform = try result;
+        try std.testing.expectEqual(PlatformTag.offscreen, std.meta.activeTag(platform));
+        try std.testing.expectEqual(@as(u32, 640), platform.offscreen.width);
+        try std.testing.expectEqual(@as(u32, 480), platform.offscreen.height);
+        try std.testing.expectEqual(@as(f64, 2), platform.offscreen.scale);
+    } else {
+        // Without -Dembedded-offscreen the tag is reserved but rejected.
+        try std.testing.expectError(error.UnsupportedPlatform, result);
+    }
+}
+
+test "embedded offscreen surface geometry and app-thread drawing" {
+    if (comptime !build_config.embedded_offscreen) return error.SkipZigTest;
+
+    var surface: Surface = undefined;
+    surface.size = .{ .width = 800, .height = 600 };
+    surface.content_scale = .{ .x = 1, .y = 1 };
+
+    // Only the offscreen platform draws from the app thread.
+    var c_platform: Platform.C = undefined;
+    c_platform.offscreen = .{ .width = 1280, .height = 720, .scale = 1.5 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    try std.testing.expect(surface.isOffscreen());
+    try std.testing.expect(surface.mustDrawFromAppThread());
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(u32, 1280), surface.size.width);
+    try std.testing.expectEqual(@as(u32, 720), surface.size.height);
+    try std.testing.expectEqual(@as(f32, 1.5), surface.content_scale.x);
+
+    // Zero size and scale keep the defaults.
+    surface.size = .{ .width = 800, .height = 600 };
+    surface.content_scale = .{ .x = 1, .y = 1 };
+    c_platform.offscreen = .{ .width = 0, .height = 0, .scale = 0 };
+    surface.platform = try Platform.init(@intFromEnum(PlatformTag.offscreen), c_platform);
+    surface.applyOffscreenInitialGeometry();
+    try std.testing.expectEqual(@as(u32, 800), surface.size.width);
+    try std.testing.expectEqual(@as(f32, 1), surface.content_scale.x);
+
+    // Callbacks are plain registrations; clearing them stops delivery.
+    const Cb = struct {
+        fn frame(_: ?*anyopaque, _: ?*const anyopaque) callconv(.c) void {}
+    };
+    surface.offscreen_frame_callback = null;
+    surface.offscreen_dmabuf_callback = null;
+    CAPI.ghostty_surface_set_frame_callback(&surface, &Cb.frame, @ptrFromInt(0x10));
+    try std.testing.expect(surface.offscreen_frame_callback != null);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(0x10)), surface.offscreen_frame_userdata);
+    CAPI.ghostty_surface_set_frame_callback(&surface, null, null);
+    try std.testing.expect(surface.offscreen_frame_callback == null);
+    CAPI.ghostty_surface_set_dmabuf_callback(&surface, &Cb.frame, null);
+    try std.testing.expect(surface.offscreen_dmabuf_callback != null);
 }
 
 pub const EnvVar = extern struct {
@@ -857,6 +1015,20 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     cursor_pos_mods: input.Mods,
     inspector: ?*Inspector = null,
+
+    /// cmux fork: offscreen platform only. Receives each presented frame as
+    /// a borrowed `*const OffscreenFrame` (CPU RGBA readback) on the thread
+    /// that called ghostty_surface_draw. Set via
+    /// ghostty_surface_set_frame_callback.
+    offscreen_frame_callback: ?OffscreenFrameCallback = null,
+    offscreen_frame_userdata: ?*anyopaque = null,
+
+    /// cmux fork: offscreen platform only (Linux). When set, each presented
+    /// frame is exported as a dmabuf (`*const OffscreenDmabufFrame`, fd owned
+    /// by the callback) instead of a CPU readback. Set via
+    /// ghostty_surface_set_dmabuf_callback.
+    offscreen_dmabuf_callback: ?OffscreenFrameCallback = null,
+    offscreen_dmabuf_userdata: ?*anyopaque = null,
     io_mode: IoMode = .exec,
     io_write_cb: ?IoWriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
@@ -973,6 +1145,10 @@ pub const Surface = struct {
             .scrollback_limit_bytes = scrollback_limit_bytes,
             .external_frame_context = .{ .raw = 0 },
         };
+
+        // Offscreen surfaces have no view to measure, so the embedder passes
+        // the initial pixel size and scale with the platform.
+        self.applyOffscreenInitialGeometry();
 
         // Add ourselves to the list of surfaces on the app.
         try app.core_app.addSurface(self);
@@ -1274,6 +1450,37 @@ pub const Surface = struct {
 
     pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
         return self.size;
+    }
+
+    /// cmux fork: true when this surface's frames must be drawn on the app
+    /// thread rather than the renderer thread. The renderer thread then asks
+    /// for a draw with the RENDER action instead of drawing itself.
+    pub fn mustDrawFromAppThread(self: *const Surface) bool {
+        return self.isOffscreen();
+    }
+
+    /// cmux fork: true for the offscreen platform (always false when it is
+    /// not compiled in).
+    pub fn isOffscreen(self: *const Surface) bool {
+        if (comptime Platform.Offscreen == void) return false;
+        return self.platform == .offscreen;
+    }
+
+    fn applyOffscreenInitialGeometry(self: *Surface) void {
+        if (comptime Platform.Offscreen == void) return;
+        const config = switch (self.platform) {
+            .offscreen => |v| v,
+            else => return,
+        };
+        if (config.width > 0 and config.height > 0) {
+            self.size = .{ .width = config.width, .height = config.height };
+        }
+        if (config.scale > 0) {
+            self.content_scale = .{
+                .x = @floatCast(config.scale),
+                .y = @floatCast(config.scale),
+            };
+        }
     }
 
     pub fn externalFrameContext(self: *const Surface) u64 {
@@ -3235,6 +3442,34 @@ pub const CAPI = struct {
     /// call as soon as possible (NOW if possible).
     export fn ghostty_surface_draw(surface: *Surface) void {
         surface.draw();
+    }
+
+    /// cmux fork: offscreen platform only. Register the callback that receives
+    /// each presented frame as a borrowed `ghostty_offscreen_frame_s*` (CPU
+    /// RGBA readback, rows bottom-up). It runs synchronously on the thread
+    /// that draws the surface (inside ghostty_surface_draw). Pass null to
+    /// stop delivery. Ignored by every other platform.
+    export fn ghostty_surface_set_frame_callback(
+        surface: *Surface,
+        callback: ?OffscreenFrameCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.offscreen_frame_callback = callback;
+        surface.offscreen_frame_userdata = userdata;
+    }
+
+    /// cmux fork: offscreen platform only (Linux). Register the callback that
+    /// receives each presented frame as a `ghostty_dmabuf_frame_s*` instead of
+    /// a CPU readback. The frame's fd is owned by the callback, which must
+    /// close it. If dmabuf export fails, the frame falls back to the frame
+    /// callback. Pass null to go back to CPU readback.
+    export fn ghostty_surface_set_dmabuf_callback(
+        surface: *Surface,
+        callback: ?OffscreenFrameCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        surface.offscreen_dmabuf_callback = callback;
+        surface.offscreen_dmabuf_userdata = userdata;
     }
 
     /// Perform a full render cycle synchronously from the calling thread.
