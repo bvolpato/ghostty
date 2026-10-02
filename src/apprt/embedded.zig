@@ -285,13 +285,14 @@ pub const App = struct {
         self: *App,
         opts: Surface.Options,
         scrollback_limit_bytes: usize,
+        argv: ?[]const [*:0]const u8,
     ) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts, scrollback_limit_bytes);
+        try surface.init(self, opts, scrollback_limit_bytes, argv);
         return surface;
     }
 
@@ -1145,6 +1146,11 @@ pub const Surface = struct {
         app: *App,
         opts: Options,
         scrollback_limit_bytes: usize,
+        /// cmux fork: a directly executed command (see
+        /// ghostty_surface_new_with_argv). When non-null it replaces
+        /// `opts.command`. It is copied, so it only needs to remain valid
+        /// for the duration of this call.
+        argv: ?[]const [*:0]const u8,
     ) !void {
         self.* = .{
             .app = app,
@@ -1225,8 +1231,19 @@ pub const Surface = struct {
             }
         }
 
-        // If we have a command from the options then we set it.
-        if (opts.command) |c_command| {
+        // cmux fork: a structured argv runs directly (no `/bin/sh -c` on
+        // POSIX, no whitespace splitting on Windows) and replaces any
+        // `opts.command`. Unlike `opts.command` it does not force
+        // `wait-after-command`, so the surface closes when the process
+        // exits, like the default shell. `opts.wait_after_command` below
+        // still applies when the embedder asks for it.
+        if (argv) |args| {
+            config.command = try commandFromArgv(config.arenaAlloc(), args);
+            // An explicit argv also wins over `initial-command`, which
+            // would otherwise replace the command of the app's first surface.
+            config.@"initial-command" = null;
+        } else if (opts.command) |c_command| {
+            // If we have a command from the options then we set it.
             const cmd = std.mem.sliceTo(c_command, 0);
             if (cmd.len > 0) {
                 config.command = .{ .shell = cmd };
@@ -1290,6 +1307,29 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    /// cmux fork: copy a C argv into a direct command owned by `alloc`.
+    /// argv[0] is the program and must be non-empty (and, on Windows, free
+    /// of double quotes); later arguments may be empty. No shell parsing or
+    /// expansion is performed.
+    pub fn commandFromArgv(
+        alloc: Allocator,
+        argv: []const [*:0]const u8,
+    ) (Allocator.Error || error{InvalidCommandArgv})!configpkg.Command {
+        if (argv.len == 0) return error.InvalidCommandArgv;
+        if (argv[0][0] == 0) return error.InvalidCommandArgv;
+        // CreateProcessW cannot represent a double quote in the program
+        // name, so reject it here instead of failing at spawn time.
+        if (comptime builtin.os.tag == .windows) {
+            if (std.mem.indexOfScalar(u8, std.mem.sliceTo(argv[0], 0), '"') != null)
+                return error.InvalidCommandArgv;
+        }
+        const direct = try alloc.alloc([:0]const u8, argv.len);
+        for (argv, direct) |c_arg, *arg| {
+            arg.* = try alloc.dupeZ(u8, std.mem.sliceTo(c_arg, 0));
+        }
+        return .{ .direct = direct };
     }
 
     pub fn fontSizeActionDidPerform(
@@ -2089,6 +2129,95 @@ test "embedded surface config ABI is pinned" {
     try std.testing.expect(IoMode.manual_mirror.suppressesTerminalResponses());
 }
 
+test "embedded surface config field offsets are pinned" {
+    // cmux fork: the macOS app and other embedders build
+    // ghostty_surface_config_s from include/ghostty.h. New surface inputs
+    // use separate entry points (for example ghostty_surface_new_with_argv)
+    // so these offsets stay fixed. test/embedded-abi/surface_config.c checks
+    // the same numbers against the C header.
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    const O = Surface.Options;
+    const expected = .{
+        .{ "platform_tag", 0 },
+        .{ "platform", 8 },
+        .{ "userdata", 48 },
+        .{ "scale_factor", 56 },
+        .{ "font_size", 64 },
+        .{ "working_directory", 72 },
+        .{ "command", 80 },
+        .{ "env_vars", 88 },
+        .{ "env_var_count", 96 },
+        .{ "initial_input", 104 },
+        .{ "wait_after_command", 112 },
+        .{ "context", 116 },
+        .{ "io_mode", 120 },
+        .{ "io_write_cb", 128 },
+        .{ "io_write_userdata", 136 },
+        .{ "renderer_event_cb", 144 },
+        .{ "pty_tee_cb", 152 },
+        .{ "pty_tee_userdata", 160 },
+    };
+    inline for (expected) |entry| {
+        try std.testing.expectEqual(@as(usize, entry[1]), @offsetOf(O, entry[0]));
+    }
+    try std.testing.expectEqual(@as(usize, 168), @sizeOf(O));
+}
+
+test "embedded surface argv becomes a copied direct command" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var program = "C:\\Program Files\\PowerShell\\7\\pwsh.exe".*;
+    const raw = [_][*:0]const u8{ &program, "-NoLogo", "", "a b $HOME" };
+    const command = try Surface.commandFromArgv(arena.allocator(), &raw);
+
+    // Overwrite the caller's buffer: the command must own its copy.
+    program[0] = 'X';
+    switch (command) {
+        .direct => |argv| {
+            try std.testing.expectEqual(@as(usize, 4), argv.len);
+            try std.testing.expectEqualStrings(
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                argv[0],
+            );
+            try std.testing.expectEqualStrings("-NoLogo", argv[1]);
+            try std.testing.expectEqualStrings("", argv[2]);
+            try std.testing.expectEqualStrings("a b $HOME", argv[3]);
+        },
+        .shell => return error.ExpectedDirectCommand,
+    }
+
+    try std.testing.expectError(
+        error.InvalidCommandArgv,
+        Surface.commandFromArgv(arena.allocator(), &.{}),
+    );
+    try std.testing.expectError(
+        error.InvalidCommandArgv,
+        Surface.commandFromArgv(arena.allocator(), &.{ "", "x" }),
+    );
+}
+
+test "embedded surface argv C input is validated" {
+    const argvFromC = CAPI.argvFromC;
+
+    // No argv: same as ghostty_surface_new.
+    try std.testing.expect((try argvFromC(null, 0)) == null);
+    const one = [_]?[*:0]const u8{"sh"};
+    try std.testing.expect((try argvFromC(&one, 0)) == null);
+
+    const good = [_]?[*:0]const u8{ "/bin/sh", "-l" };
+    const args = (try argvFromC(&good, good.len)).?;
+    try std.testing.expectEqual(@as(usize, 2), args.len);
+    try std.testing.expectEqualStrings("/bin/sh", std.mem.sliceTo(args[0], 0));
+    try std.testing.expectEqualStrings("-l", std.mem.sliceTo(args[1], 0));
+
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(null, 1));
+    const null_item = [_]?[*:0]const u8{ "/bin/sh", null };
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(&null_item, 2));
+    const empty_program = [_]?[*:0]const u8{""};
+    try std.testing.expectError(error.InvalidCommandArgv, argvFromC(&empty_program, 1));
+}
+
 comptime {
     const defaults: Surface.Options = .{};
     if (@sizeOf(Surface.Options) != surface_config_abi_size)
@@ -2766,10 +2895,49 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts, 0) catch |err| {
+        return surface_new_(app, opts, 0, null) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
+    }
+
+    /// cmux fork: create a surface whose command is a directly executed
+    /// argv. argv[0] is the program (PATH is searched); the strings are
+    /// copied and only need to remain valid for the duration of the call.
+    /// When `argv_len > 0`, `opts.command` and `initial-command` are
+    /// ignored and `wait-after-command` is not forced, so the surface closes
+    /// when the process exits (unless the exit is abnormal, as for any
+    /// shell). `argv_len == 0` behaves like ghostty_surface_new. Returns null if `argv` (or any element) is
+    /// null or argv[0] is empty.
+    export fn ghostty_surface_new_with_argv(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        argv: ?[*]const ?[*:0]const u8,
+        argv_len: usize,
+    ) ?*Surface {
+        const args = argvFromC(argv, argv_len) catch |err| {
+            log.err("invalid surface argv err={}", .{err});
+            return null;
+        };
+        return surface_new_(app, opts, 0, args) catch |err| {
+            log.err("error initializing argv surface err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Validate a C argv. Null means "no argv" (only when argv_len is 0).
+    fn argvFromC(
+        argv: ?[*]const ?[*:0]const u8,
+        argv_len: usize,
+    ) error{InvalidCommandArgv}!?[]const [*:0]const u8 {
+        if (argv_len == 0) return null;
+        const ptr = argv orelse return error.InvalidCommandArgv;
+        const items = ptr[0..argv_len];
+        for (items) |item| if (item == null) return error.InvalidCommandArgv;
+        if (items[0].?[0] == 0) return error.InvalidCommandArgv;
+        // Every element is non-null, so the optional pointers have the
+        // same representation as the non-optional ones.
+        return @ptrCast(items);
     }
 
     /// Create a surface with an embedder-owned upper bound for scrollback
@@ -2779,7 +2947,7 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) ?*Surface {
-        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
+        return surface_new_(app, opts, scrollback_limit_bytes, null) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2789,8 +2957,9 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
+        argv: ?[]const [*:0]const u8,
     ) !*Surface {
-        return try app.newSurface(opts.*, scrollback_limit_bytes);
+        return try app.newSurface(opts.*, scrollback_limit_bytes, argv);
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
