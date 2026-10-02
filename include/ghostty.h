@@ -1395,6 +1395,23 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
     ghostty_app_t,
     const ghostty_surface_config_s*,
     size_t scrollback_limit_bytes);
+// cmux fork: create a surface whose command is a directly executed argv,
+// without changing ghostty_surface_config_s's public ABI. argv[0] is the
+// program (PATH is searched); no shell parsing or expansion is performed. On
+// POSIX the argv is exec'd without /bin/sh (macOS still uses login(1) like
+// Ghostty's `direct:` command config). On Windows it is serialized with
+// CreateProcessW quoting rules; argv[0] must not contain a double quote. The
+// strings are copied and only need to remain valid for the duration of the
+// call. config->command is ignored and wait-after-command is not forced, so
+// the surface closes when the process exits (config->wait_after_command still
+// applies). argv_len == 0 behaves like ghostty_surface_new. Returns NULL if
+// argv or any element is NULL, argv[0] is empty, or (Windows) argv[0]
+// contains a double quote.
+GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_argv(
+    ghostty_app_t,
+    const ghostty_surface_config_s*,
+    const char* const* argv,
+    size_t argv_len);
 // cmux fork: retire the surface from Ghostty app routing and begin bounded
 // child-process termination without joining or freeing native surface state.
 // After this call, the embedder must make no other surface API calls and must
