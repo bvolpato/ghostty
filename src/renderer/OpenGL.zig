@@ -117,6 +117,20 @@ const Offscreen = struct {
     dmabuf_width: usize = 0,
     dmabuf_height: usize = 0,
 
+    /// The EGL context this renderer's GL objects were created in (the one
+    /// current on the thread that ran surfaceInit). Drawing on any other
+    /// thread would use a different context and foreign object names.
+    context: if (offscreen_enabled) egl.EGLContext else void,
+
+    /// Set by drawFrameStart. False when the offscreen context could not be
+    /// made current on this thread, so surfaceSize fails and the frame is
+    /// skipped instead of issuing GL calls without the right context.
+    ready: bool = false,
+
+    /// Log only the first dmabuf export failure; drivers without the
+    /// extension fail on every frame.
+    dmabuf_failure_logged: bool = false,
+
     /// Deliver a rendered target to the embedder: as a dmabuf when a dmabuf
     /// callback is registered and export works, otherwise as a CPU readback.
     fn present(self: *Offscreen, target: Target) !void {
@@ -125,7 +139,10 @@ const Offscreen = struct {
             if (self.presentDmabuf(target)) |_| return else |err| {
                 // Drivers without EGL_MESA_image_dma_buf_export (llvmpipe)
                 // still get frames through the CPU path.
-                log.warn("dmabuf export failed, using CPU readback err={}", .{err});
+                if (!self.dmabuf_failure_logged) {
+                    self.dmabuf_failure_logged = true;
+                    log.warn("dmabuf export failed, using CPU readback err={}", .{err});
+                }
             }
         }
         try self.presentCpu(target);
@@ -262,11 +279,20 @@ const Offscreen = struct {
         callback(self.surface.offscreen_dmabuf_userdata, @ptrCast(&frame));
     }
 
+    /// Make this renderer's context current on the calling thread. Fails
+    /// when the calling thread's offscreen context is not the one that owns
+    /// this renderer's GL objects (the surface was created on another thread).
+    fn makeCurrent(self: *const Offscreen) !void {
+        try offscreenMakeCurrent();
+        if (egl_offscreen.?.ctx != self.context) {
+            log.err("offscreen surface drawn or freed on a thread other than the one that created it", .{});
+            return error.OffscreenWrongThread;
+        }
+    }
+
     fn deinit(self: *Offscreen) void {
-        // GL objects belong to the shared context, which must be current.
-        offscreenMakeCurrent() catch |err| {
-            log.warn("offscreen context unavailable during teardown err={}", .{err});
-        };
+        // prepareDeinit made the shared context current before the generic
+        // renderer released its GL objects.
         if (self.dmabuf_fbo) |f| f.destroy();
         if (self.dmabuf_tex) |t| t.destroy();
         if (self.readback.len > 0) self.alloc.free(self.readback);
@@ -300,10 +326,28 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
     };
     if (comptime offscreen_enabled) {
         if (isOffscreenSurface(opts.rt_surface)) {
-            result.offscreen = .{ .alloc = alloc, .surface = opts.rt_surface };
+            // surfaceInit made this thread's offscreen context current just
+            // before the renderer is created, on the same thread.
+            const ctx = egl_offscreen orelse unreachable;
+            result.offscreen = .{
+                .alloc = alloc,
+                .surface = opts.rt_surface,
+                .context = ctx.ctx,
+            };
         }
     }
     return result;
+}
+
+/// Called before the generic renderer releases its GL objects. Offscreen GL
+/// objects belong to the shared offscreen context, which the host may have
+/// replaced on this thread since the last draw.
+pub fn prepareDeinit(self: *OpenGL) void {
+    if (comptime offscreen_enabled) {
+        if (self.offscreen) |*o| o.makeCurrent() catch |err| {
+            log.warn("offscreen context unavailable during teardown err={}", .{err});
+        };
+    }
 }
 
 pub fn deinit(self: *OpenGL) void {
@@ -522,14 +566,17 @@ pub fn displayRealized(self: *const OpenGL) !void {
 /// when a drawable changes size, so synchronize it before every frame.
 pub fn drawFrameStart(self: *OpenGL) void {
     if (comptime offscreen_enabled) {
-        if (self.offscreen) |o| {
+        if (self.offscreen) |*o| {
             // Another context may have been made current on this thread since
             // the last frame (e.g. by the host). A surfaceless context also
-            // starts with a 0x0 viewport.
-            offscreenMakeCurrent() catch |err| {
+            // starts with a 0x0 viewport. On failure surfaceSize reports the
+            // error, so drawFrame stops before any GL call.
+            o.ready = false;
+            o.makeCurrent() catch |err| {
                 log.err("error making offscreen context current err={}", .{err});
                 return;
             };
+            o.ready = true;
             const size = o.surface.getSize() catch return;
             gl.glad.context.Viewport.?(
                 0,
@@ -579,6 +626,7 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     if (comptime offscreen_enabled) {
         // No drawable to query; the embedder sets the size.
         if (self.offscreen) |o| {
+            if (!o.ready) return error.OpenGLContextNotCurrent;
             const size = try o.surface.getSize();
             return .{ .width = size.width, .height = size.height };
         }
