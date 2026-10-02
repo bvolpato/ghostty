@@ -1000,6 +1000,93 @@ test "Command: direct argv reaches the child verbatim" {
     try testing.expectEqualStrings("[a b][$HOME][][*]", data);
 }
 
+test "windowsCreateCommandLine round-trips through CommandLineToArgvW" {
+    // Parse our command lines with the real Windows parser (the same rules
+    // CreateProcessW uses for argv[0]) and expect the original argv back.
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const shell32 = struct {
+        extern "shell32" fn CommandLineToArgvW(
+            lpCmdLine: windows.LPCWSTR,
+            pNumArgs: *c_int,
+        ) callconv(.winapi) ?[*]windows.LPWSTR;
+    };
+    const kernel32 = struct {
+        extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    };
+
+    const cases = [_][]const []const u8{
+        &.{ "C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoLogo", "value with spaces" },
+        &.{ "C:\\dir with space\\", "C:\\dir with space\\", "a\\\\b\\c", "a\\\"b" },
+        &.{ "zig", "", "aa", "", "\"", "\\\"", "tab\there", "--x=\"y z\"" },
+        &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "trailing\\\\" },
+    };
+    for (cases) |argv| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const line = try windowsCreateCommandLine(alloc, argv);
+        const line_w = try std.unicode.utf8ToUtf16LeAllocZ(alloc, line);
+        var argc: c_int = 0;
+        const parsed = shell32.CommandLineToArgvW(line_w.ptr, &argc) orelse
+            return windows.unexpectedError(windows.GetLastError());
+        defer _ = kernel32.LocalFree(@ptrCast(parsed));
+
+        try testing.expectEqual(@as(c_int, @intCast(argv.len)), argc);
+        for (argv, 0..) |expected, i| {
+            const actual = try std.unicode.utf16LeToUtf8Alloc(
+                alloc,
+                std.mem.sliceTo(parsed[i], 0),
+            );
+            try testing.expectEqualStrings(expected, actual);
+        }
+    }
+}
+
+test "Command: windows program path with spaces starts" {
+    // A program whose path contains spaces must start as one token, not be
+    // split at "C:\Program".
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    var td = try TempDir.init();
+    defer td.deinit();
+    try std.Io.Dir.cwd().copyFile(
+        "C:\\Windows\\System32\\whoami.exe",
+        td.dir,
+        "dir with space\\who ami.exe",
+        testing.io,
+        .{ .make_path = true },
+    );
+    const program = try td.dir.realPathFileAlloc(
+        testing.io,
+        "dir with space\\who ami.exe",
+        testing.allocator,
+    );
+    defer testing.allocator.free(program);
+
+    var stdout = try createTestStdout(testing.io, td.dir);
+    defer stdout.close(testing.io);
+
+    var cmd: Command = .{
+        .path = program,
+        .args = &.{program},
+        .stdout = stdout,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    try cmd.testingStart();
+    try testing.expect(cmd.pid != null);
+    const exit = try cmd.wait(true);
+    try testing.expect(exit == .Exited);
+    try testing.expectEqual(@as(u32, 0), @as(u32, exit.Exited));
+    try testing.expect((try stdout.stat(testing.io)).size > 0);
+}
+
 test "Command: custom env vars" {
     var td = try TempDir.init();
     defer td.deinit();
