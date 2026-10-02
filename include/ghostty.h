@@ -548,6 +548,12 @@ typedef struct {
 // offscreen surfaces on that one thread. Terminal IO is independent: combine
 // it with GHOSTTY_SURFACE_IO_MANUAL_MIRROR to render an embedder-owned PTY.
 //
+// The EGL context is created on first use and is never destroyed; it lives
+// until the drawing thread or the process exits. On Linux, link the final
+// executable with -lEGL (libghostty references the egl* symbols but does not
+// load libEGL itself). On Windows, Mesa's libEGL.dll is loaded at runtime from
+// cmux_mesa\ next to the executable, then from the default search path.
+//
 // width/height are the initial size in pixels (0 keeps the default) and
 // scale the initial content scale (<= 0 keeps scale_factor). Use
 // ghostty_surface_set_size and ghostty_surface_set_content_scale to change
@@ -1422,10 +1428,15 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 // cmux fork: offscreen platform frame delivery. `frame` is borrowed and valid
 // only during the call. Callbacks run on the thread that draws the surface
 // (inside ghostty_surface_draw). Other platforms ignore these registrations.
+// Call the setters on that same thread. A callback must not call
+// ghostty_surface_draw, ghostty_surface_free, or either setter for the surface
+// that is being drawn: the draw holds renderer locks and still uses the
+// surface after the callback returns.
 typedef void (*ghostty_frame_callback_cb)(void* userdata, const void* frame);
 
 // One CPU-readback frame: RGBA8, rows bottom-up (OpenGL order), `stride`
 // bytes per row. Passed as the `frame` argument of the frame callback.
+// `data` is reused for the next frame: copy it before the callback returns.
 typedef struct {
   uint32_t width;
   uint32_t height;
@@ -1440,6 +1451,9 @@ GHOSTTY_API void ghostty_surface_set_frame_callback(ghostty_surface_t,
 
 // One dmabuf-exported frame (Linux): a single RGBA plane. The callback owns
 // `fd` and must close it. The DRM format modifier is split into hi/lo halves.
+// Every frame of a surface exports the same GPU buffer (a new fd each time),
+// and the next ghostty_surface_draw of that surface overwrites it. The
+// rendering is complete (glFinish) before the callback runs.
 typedef struct {
   int32_t fd;
   uint32_t fourcc;
