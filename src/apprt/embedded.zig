@@ -1239,6 +1239,9 @@ pub const Surface = struct {
         // still applies when the embedder asks for it.
         if (argv) |args| {
             config.command = try commandFromArgv(config.arenaAlloc(), args);
+            // An explicit argv also wins over `initial-command`, which
+            // would otherwise replace the command of the app's first surface.
+            config.@"initial-command" = null;
         } else if (opts.command) |c_command| {
             // If we have a command from the options then we set it.
             const cmd = std.mem.sliceTo(c_command, 0);
@@ -2901,9 +2904,10 @@ pub const CAPI = struct {
     /// cmux fork: create a surface whose command is a directly executed
     /// argv. argv[0] is the program (PATH is searched); the strings are
     /// copied and only need to remain valid for the duration of the call.
-    /// `opts.command` is ignored and `wait-after-command` is not forced, so
-    /// the surface closes when the process exits. `argv_len == 0` behaves
-    /// like ghostty_surface_new. Returns null if `argv` (or any element) is
+    /// When `argv_len > 0`, `opts.command` and `initial-command` are
+    /// ignored and `wait-after-command` is not forced, so the surface closes
+    /// when the process exits (unless the exit is abnormal, as for any
+    /// shell). `argv_len == 0` behaves like ghostty_surface_new. Returns null if `argv` (or any element) is
     /// null or argv[0] is empty.
     export fn ghostty_surface_new_with_argv(
         app: *App,

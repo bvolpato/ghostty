@@ -977,8 +977,8 @@ test "Command: direct argv reaches the child verbatim" {
     defer stdout.close(testing.io);
 
     var cmd: Command = .{
-        .path = "/usr/bin/printf",
-        .args = &.{ "/usr/bin/printf", "[%s]", "a b", "$HOME", "", "*" },
+        .path = "/bin/sh",
+        .args = &.{ "/bin/sh", "-c", "printf '[%s]' \"$@\"", "sh", "a b", "$HOME", "", "*" },
         .stdout = stdout,
         .os_pre_exec = null,
         .rt_pre_exec = null,

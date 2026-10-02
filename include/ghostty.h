@@ -1400,13 +1400,21 @@ GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_scrollback_limit(
 // program (PATH is searched); no shell parsing or expansion is performed. On
 // POSIX the argv is exec'd without /bin/sh (macOS still uses login(1) like
 // Ghostty's `direct:` command config). On Windows it is serialized with
-// CreateProcessW quoting rules; argv[0] must not contain a double quote. The
-// strings are copied and only need to remain valid for the duration of the
-// call. config->command is ignored and wait-after-command is not forced, so
-// the surface closes when the process exits (config->wait_after_command still
-// applies). argv_len == 0 behaves like ghostty_surface_new. Returns NULL if
-// argv or any element is NULL, argv[0] is empty, or (Windows) argv[0]
-// contains a double quote.
+// CreateProcessW quoting rules; argv[0] must not contain a double quote.
+// Exception: on macOS, bash and nu shell integration (when enabled) still
+// rewrites the argv into a /bin/sh command string, as upstream does for
+// `direct:` commands; set shell-integration = none to avoid it.
+// The strings are copied and only need to remain valid for the duration of
+// the call.
+//
+// When argv_len > 0, config->command and the `initial-command` config are
+// ignored, and wait-after-command is not forced: the surface closes when the
+// process exits, like the default shell. As for any shell, an exit within
+// abnormal-command-exit-runtime (nonzero status, or any status on macOS)
+// keeps the surface open with an error message. config->wait_after_command
+// still applies. argv_len == 0 behaves like ghostty_surface_new. Returns
+// NULL if argv or any element is NULL, argv[0] is empty, or (Windows)
+// argv[0] contains a double quote.
 GHOSTTY_API ghostty_surface_t ghostty_surface_new_with_argv(
     ghostty_app_t,
     const ghostty_surface_config_s*,
