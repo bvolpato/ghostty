@@ -129,8 +129,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closePipeEnd(pipe[0]);
+    errdefer closePipeEnd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -209,7 +209,18 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+    if (comptime builtin.os.tag == .windows) {
+        // The quit pipe is a Win32 HANDLE (os/pipe.zig), not a CRT fd: the
+        // CRT's write() fails fast on it (invalid parameter).
+        var written: windows.DWORD = 0;
+        if (windows.exp.kernel32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                // The read thread already closed its end.
+                .BROKEN_PIPE, .NO_DATA => {},
+                else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+            }
+        }
+    } else switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
         // EPIPE means that our read thread is closed already, which is
@@ -233,6 +244,17 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     exec.read_thread.join();
+}
+
+/// Closes one end of the read-thread quit pipe from `internal_os.pipe`: a
+/// Win32 HANDLE on Windows (the CRT's close() fails fast on it), a file
+/// descriptor elsewhere.
+fn closePipeEnd(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
 }
 
 pub fn focusGained(
@@ -553,7 +575,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closePipeEnd(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -2172,7 +2194,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer closePipeEnd(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
