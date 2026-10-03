@@ -210,16 +210,7 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
     if (comptime builtin.os.tag == .windows) {
-        // The quit pipe is a Win32 HANDLE (os/pipe.zig), not a CRT fd: the
-        // CRT's write() fails fast on it (invalid parameter).
-        var written: windows.DWORD = 0;
-        if (windows.exp.kernel32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
-            switch (windows.GetLastError()) {
-                // The read thread already closed its end.
-                .BROKEN_PIPE, .NO_DATA => {},
-                else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
-            }
-        }
+        signalReadThreadQuitWindows(exec.read_thread_pipe);
     } else switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
@@ -244,6 +235,20 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     exec.read_thread.join();
+}
+
+/// Writes the quit byte to the read thread's quit pipe on Windows. The pipe
+/// is a Win32 HANDLE (os/pipe.zig), not a CRT fd: the CRT's write() fails
+/// fast on it (invalid parameter).
+fn signalReadThreadQuitWindows(pipe: posix.fd_t) void {
+    var written: windows.DWORD = 0;
+    if (windows.exp.kernel32.WriteFile(pipe, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read thread already closed its end.
+            .BROKEN_PIPE, .NO_DATA => {},
+            else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+        }
+    }
 }
 
 /// Closes one end of the read-thread quit pipe from `internal_os.pipe`: a
@@ -2318,6 +2323,30 @@ pub const ReadThread = struct {
         return @intCast(n);
     }
 };
+
+test "Windows read thread quit pipe uses Win32 handle calls" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // internal_os.pipe returns Win32 HANDLEs on Windows. The CRT's write()
+    // and close() fail fast on them (0xC0000409), so this test crashes if
+    // the quit signal or the close goes through the CRT again.
+    const pipe = try internal_os.pipe();
+    var read_open = true;
+    defer if (read_open) closePipeEnd(pipe[0]);
+    defer closePipeEnd(pipe[1]);
+
+    try testing.expect(!ReadThread.windowsQuitRequested(pipe[0]));
+    signalReadThreadQuitWindows(pipe[1]);
+    try testing.expect(ReadThread.windowsQuitRequested(pipe[0]));
+
+    // The read thread can exit (child EOF) and close its end before
+    // teardown signals it: the write must fail quietly, not crash.
+    closePipeEnd(pipe[0]);
+    read_open = false;
+    signalReadThreadQuitWindows(pipe[1]);
+}
 
 test "io-gather exits on persistent EOF readiness" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
