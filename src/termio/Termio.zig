@@ -52,9 +52,14 @@ terminal: terminalpkg.Terminal,
 /// The shared render state
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// The renderer thread's own wakeup handle (not a copy). This hints to the
+/// renderer that a repaint should happen. A pointer because libxev's IOCP
+/// `Async` (Windows) keeps its waiter inside the struct: a copy made before
+/// the renderer thread starts waiting never wakes it, so PTY output did not
+/// redraw a terminal there until something else (focus, resize, cursor
+/// blink) woke its renderer. The eventfd and kqueue backends share a handle
+/// between copies, which hid this elsewhere.
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
