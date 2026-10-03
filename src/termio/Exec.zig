@@ -129,8 +129,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closePipeEnd(pipe[0]);
+    errdefer closePipeEnd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -209,7 +209,9 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+    if (comptime builtin.os.tag == .windows) {
+        signalReadThreadQuitWindows(exec.read_thread_pipe);
+    } else switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
         // EPIPE means that our read thread is closed already, which is
@@ -233,6 +235,31 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     exec.read_thread.join();
+}
+
+/// Writes the quit byte to the read thread's quit pipe on Windows. The pipe
+/// is a Win32 HANDLE (os/pipe.zig), not a CRT fd: the CRT's write() fails
+/// fast on it (invalid parameter).
+fn signalReadThreadQuitWindows(pipe: posix.fd_t) void {
+    var written: windows.DWORD = 0;
+    if (windows.exp.kernel32.WriteFile(pipe, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read thread already closed its end.
+            .BROKEN_PIPE, .NO_DATA => {},
+            else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+        }
+    }
+}
+
+/// Closes one end of the read-thread quit pipe from `internal_os.pipe`: a
+/// Win32 HANDLE on Windows (the CRT's close() fails fast on it), a file
+/// descriptor elsewhere.
+fn closePipeEnd(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
 }
 
 pub fn focusGained(
@@ -553,7 +580,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closePipeEnd(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -1113,6 +1140,21 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.releaseProcess();
+    }
+
+    /// Forgets the started process. On Windows this also closes the
+    /// CreateProcessW process handle (Command.pid), which only this struct
+    /// owns: the xev watcher waits on its own duplicate.
+    fn releaseProcess(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |process| switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |pid| {
+                    _ = windows.exp.kernel32.CloseHandle(pid);
+                },
+                .flatpak => {},
+            };
+        }
         self.process = null;
     }
 
@@ -1158,7 +1200,7 @@ const Subprocess = struct {
             }
         }
 
-        self.process = null;
+        self.releaseProcess();
         self.process_group_id = null;
     }
 
@@ -2172,7 +2214,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer closePipeEnd(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -2296,6 +2338,30 @@ pub const ReadThread = struct {
         return @intCast(n);
     }
 };
+
+test "Windows read thread quit pipe uses Win32 handle calls" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // internal_os.pipe returns Win32 HANDLEs on Windows. The CRT's write()
+    // and close() fail fast on them (0xC0000409), so this test crashes if
+    // the quit signal or the close goes through the CRT again.
+    const pipe = try internal_os.pipe();
+    var read_open = true;
+    defer if (read_open) closePipeEnd(pipe[0]);
+    defer closePipeEnd(pipe[1]);
+
+    try testing.expect(!ReadThread.windowsQuitRequested(pipe[0]));
+    signalReadThreadQuitWindows(pipe[1]);
+    try testing.expect(ReadThread.windowsQuitRequested(pipe[0]));
+
+    // The read thread can exit (child EOF) and close its end before
+    // teardown signals it: the write must fail quietly, not crash.
+    closePipeEnd(pipe[0]);
+    read_open = false;
+    signalReadThreadQuitWindows(pipe[1]);
+}
 
 test "io-gather exits on persistent EOF readiness" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
