@@ -1140,6 +1140,21 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.releaseProcess();
+    }
+
+    /// Forgets the started process. On Windows this also closes the
+    /// CreateProcessW process handle (Command.pid), which only this struct
+    /// owns: the xev watcher waits on its own duplicate.
+    fn releaseProcess(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |process| switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |pid| {
+                    _ = windows.exp.kernel32.CloseHandle(pid);
+                },
+                .flatpak => {},
+            };
+        }
         self.process = null;
     }
 
@@ -1185,7 +1200,7 @@ const Subprocess = struct {
             }
         }
 
-        self.process = null;
+        self.releaseProcess();
         self.process_group_id = null;
     }
 

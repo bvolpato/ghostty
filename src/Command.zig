@@ -432,6 +432,9 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+    // Nothing uses the primary thread handle; keeping it leaks one handle
+    // per started command.
+    _ = windows.exp.kernel32.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
 }
 
