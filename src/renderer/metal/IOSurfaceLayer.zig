@@ -460,6 +460,13 @@ fn invalidateSurfaceUpdatesCallback(
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
     layer.setInstanceVariable("surface_updates_active", .{ .value = null });
+
+    // The host view keeps this layer after the renderer is freed, and a later
+    // Core Animation display would call drawFrame on that freed renderer
+    // (manaflow-ai/cmux#17483). Renderer teardown reaches here on main after
+    // the renderer thread joins, so loopEnter cannot bind the callback again.
+    layer.setInstanceVariable("display_cb", .{ .value = null });
+    layer.setInstanceVariable("display_ctx", .{ .value = null });
 }
 
 fn clearSurfaceCallback(
