@@ -79,8 +79,7 @@ pub fn isHangul(cp: u32) bool {
         (cp >= 0x3130 and cp <= 0x318F) or // Hangul Compatibility Jamo
         (cp >= 0xA960 and cp <= 0xA97F) or // Hangul Jamo Extended-A
         (cp >= 0xAC00 and cp <= 0xD7A3) or // Hangul syllables
-        (cp >= 0xD7B0 and cp <= 0xD7FF) or // Hangul Jamo Extended-B
-        (cp >= 0xFFA0 and cp <= 0xFFDC); // Halfwidth Hangul
+        (cp >= 0xD7B0 and cp <= 0xD7FF); // Hangul Jamo Extended-B
 }
 
 /// Select the fallback size adjustment for a codepoint. Hangul keeps the
@@ -107,6 +106,10 @@ test "fallback size adjustment follows the Unicode script" {
     try testing.expectEqual(
         Collection.SizeAdjustment.fallback_ic_width_capped,
         fallbackSizeAdjustment(0x65E5),
+    );
+    try testing.expectEqual(
+        Collection.SizeAdjustment.fallback_ic_width_capped,
+        fallbackSizeAdjustment(0xFFA0),
     );
 }
 
