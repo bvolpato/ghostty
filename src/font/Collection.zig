@@ -1413,7 +1413,7 @@ test "adjusted sizes" {
     }
 }
 
-test "Hangul fallback sizing fills two primary cells" {
+test "ideograph fallback sizing fills two primary cells" {
     const testing = std.testing;
 
     var collection = init();
