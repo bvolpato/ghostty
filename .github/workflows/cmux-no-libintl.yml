@@ -60,7 +60,21 @@ jobs:
             -Demit-xcframework=true \
             -Demit-macos-app=false \
             -Dxcframework-target=universal \
-            -Doptimize=ReleaseFast
+            -Doptimize=ReleaseFast \
+            --summary all 2>&1 | tee xcframework-build.log
+
+      # The archive contents depend on whether the lazy gettext package was
+      # resolved in this environment (cmux's cached build ships 30 libintl
+      # objects; a fresh runner compiles none), so also check the build graph:
+      # an -Di18n=false build must not compile the libintl library at all.
+      - name: Check the build graph for libintl
+        run: |
+          set -euo pipefail
+          if grep -nE 'compile lib intl|libintl' xcframework-build.log; then
+            echo "::error::the -Di18n=false GhosttyKit build still builds or links libintl"
+            exit 1
+          fi
+          echo "no libintl step in the -Di18n=false build graph"
 
       - name: Build ghostty CLI (-Di18n=false, as cmux's helper)
         run: |
