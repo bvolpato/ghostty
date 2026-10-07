@@ -36,16 +36,18 @@ jobs:
           echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
           "/tmp/zig-${arch}-macos-${version}/zig" version
 
-      # cmux's GhosttyKit build restores ~/.cache/zig, which holds the gettext
-      # tarball, so pkg/libintl compiles the full libintl. On a fresh runner the
-      # lazy gettext dependency is unfetched, pkg/libintl builds an empty
-      # archive and the bug is hidden. Fetch it the way cmux's cache has it.
-      - name: Fetch gettext into the Zig cache (as cmux's cache has it)
+      # cmux's build-ghosttykit.yml runs this exact test step before it builds
+      # the -Di18n=false xcframework, in the same checkout. Without it the
+      # xcframework here never contained libintl (11 archives to libtool;
+      # cmux's log shows 12), so the check could not reproduce the shipped bug.
+      - name: Test Ghostty OS opener stderr reader (as cmux's build does first)
         run: |
           set -euo pipefail
-          url="$(awk -F '"' '/\.url = .*gettext/ { print $2; exit }' pkg/libintl/build.zig.zon)"
-          echo "fetching $url"
-          zig fetch "$url"
+          zig build test \
+            -Dapp-runtime=none \
+            -Demit-macos-app=false \
+            -Dsentry=false \
+            -Dtest-filter="open stderr reader exits"
 
       # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
       - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
