@@ -9,6 +9,12 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Advisory guard, not the real gate. On a fresh runner the lazy libintl
+  # dependency of a -Di18n=false build may never resolve, so this job can be
+  # green even when cmux's cached build ships libintl (it was green on the
+  # pre-fix commits of manaflow-ai/ghostty#262). The real gate is cmux's
+  # scripts/verify_app_libintl.py, run on the built and published app by
+  # cmux's release.yml and nightly.yml.
   no-libintl:
     runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 45
