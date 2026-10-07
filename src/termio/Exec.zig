@@ -3022,6 +3022,74 @@ test "subprocess stop kills a distinct foreground process group" {
     try testing.expectEqual(posix.E.SRCH, foreground_probe_err);
 }
 
+test "subprocess stop never signals the caller's own process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    // Open the pty before forking: openpty is not async-signal-safe.
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    // Teardown must never signal the process group that runs it. Run the
+    // check in a forked child that owns a fresh session whose controlling
+    // terminal reports the child's own group as foreground. A regression then
+    // kills only that child, never the test runner's process group.
+    const child_pid: posix.pid_t = child: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :child @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (child_pid == 0) {
+        if (c.setsid() < 0) c._exit(10);
+        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(12);
+        const own_pgid = c.getpgrp();
+        const foreground = pty.getProcessInfo(.foreground_pid) orelse c._exit(13);
+        if (foreground != @as(u64, @intCast(own_pgid))) c._exit(14);
+
+        var subprocess: Subprocess = .{
+            .arena = ArenaAllocator.init(std.heap.page_allocator),
+            .cwd = null,
+            .env = null,
+            .args = &.{},
+            .grid_size = .{},
+            .screen_size = .{ .width = 1, .height = 1 },
+            .pty = pty,
+            .process = null,
+            .process_group_id = own_pgid,
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        };
+        if (subprocess.foregroundProcessGroupId() != null) c._exit(15);
+        subprocess.stopWithTimeouts(.{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        });
+
+        if (Subprocess.killProcessGroupWithTimeouts(own_pgid, null, .{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        })) |_| c._exit(16) else |_| {}
+        c._exit(0);
+    }
+
+    var status: c_int = 0;
+    try testing.expectEqual(
+        child_pid,
+        @as(posix.pid_t, @intCast(posix.system.waitpid(child_pid, &status, 0))),
+    );
+    // A signal death here means teardown signalled its own process group.
+    const exit_status: u32 = @bitCast(status);
+    try testing.expect(!posix.W.IFSIGNALED(exit_status));
+    try testing.expect(posix.W.IFEXITED(exit_status));
+    try testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(exit_status));
+}
+
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
 /// we deal with shell-wrapping, macOS login shells, etc.
