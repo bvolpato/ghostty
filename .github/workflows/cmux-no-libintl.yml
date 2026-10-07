@@ -36,6 +36,13 @@ jobs:
           echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
           "/tmp/zig-${arch}-macos-${version}/zig" version
 
+      # cmux's build-ghosttykit.yml runs `zig build test` (i18n on) first, so
+      # every lazy dependency, libintl included, is already fetched when the
+      # -Di18n=false xcframework builds. A fresh checkout leaves the lazy
+      # libintl path dependency unresolved and hides the bug, so fetch all.
+      - name: Fetch all dependencies (as cmux's build has them)
+        run: zig build --fetch=all
+
       # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
       - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
         run: |
