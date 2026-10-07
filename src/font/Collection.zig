@@ -1469,7 +1469,7 @@ test "ideograph fallback sizing keeps the primary ASCII height by default" {
     // Non-Hangul CJK fallback should retain the existing ASCII-height cap.
     try testing.expectEqual(
         10.0 / 8.0,
-        collection.scaleFactor(fallback, .ic_width),
+        collection.scaleFactor(fallback, .fallback_ic_width_capped),
     );
 }
 
