@@ -14,6 +14,7 @@ while IFS= read -r -d '' f; do
     *) continue ;;
   esac
   checked=$((checked + 1))
+  echo "checking $f"
   hits="$(nm -A -arch all "$f" 2>/dev/null \
     | grep -E ' [TDSBC] _?_libintl_|[:(](dcigettext|loadmsgcat|bindtextdom)\.o[):]' || true)"
   if [[ -n "$hits" ]]; then

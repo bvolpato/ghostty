@@ -36,17 +36,18 @@ jobs:
           echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
           "/tmp/zig-${arch}-macos-${version}/zig" version
 
-      - name: Build GhosttyKit xcframework (native, -Di18n=false)
+      # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
+      - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
         run: |
           set -euo pipefail
           zig build \
+            -Dcrash-report-subdir=cmux/crash \
             -Dsentry=false \
             -Di18n=false \
             -Demit-xcframework=true \
             -Demit-macos-app=false \
-            -Dxcframework-target=native \
-            -Doptimize=ReleaseFast \
-            --prefix zig-out-xcframework
+            -Dxcframework-target=universal \
+            -Doptimize=ReleaseFast
 
       - name: Build ghostty CLI (-Di18n=false, as cmux's helper)
         run: |
@@ -63,5 +64,5 @@ jobs:
         run: |
           set -euo pipefail
           paths=(zig-out-cli macos/GhosttyKit.xcframework)
-          ls -d "${paths[@]}"
+          find "${paths[@]}" -type f \( -name '*.a' -o -perm -u+x \) -print -exec file -b {} \;
           .github/scripts/check-no-libintl.sh "${paths[@]}"
