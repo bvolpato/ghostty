@@ -1552,6 +1552,23 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        if (comptime builtin.os.tag == .windows and info == .foreground_pid) {
+            // ConPTY has no foreground process group, so the PTY cannot
+            // report one (WindowsPty.getProcessInfo returns null, and
+            // foregroundProcessGroupId relies on that). Report the direct
+            // child's process id instead: the shell, not the program the
+            // shell is running. Callers that want the running program must
+            // walk the child's process tree.
+            const process = self.process orelse return null;
+            return switch (process) {
+                .fork_exec => |cmd| if (cmd.windows_process_id) |id|
+                    if (id != 0) id else null
+                else
+                    null,
+                .flatpak => null,
+            };
+        }
+
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }
@@ -2361,6 +2378,49 @@ test "Windows read thread quit pipe uses Win32 handle calls" {
     closePipeEnd(pipe[0]);
     read_open = false;
     signalReadThreadQuitWindows(pipe[1]);
+}
+
+test "Windows subprocess foreground_pid is the child process id" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const comspec = testing.environ.getAlloc(testing.allocator, "COMSPEC") catch
+        try testing.allocator.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
+    defer testing.allocator.free(comspec);
+    const shell = try testing.allocator.dupeZ(u8, comspec);
+    defer testing.allocator.free(shell);
+
+    var subprocess: Subprocess = .{
+        .arena = ArenaAllocator.init(testing.allocator),
+        .cwd = null,
+        .env = null,
+        .args = &.{shell},
+        .grid_size = .{ .columns = 80, .rows = 24 },
+        .screen_size = .{ .width = 800, .height = 600 },
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    defer subprocess.deinit();
+
+    // Not started: no process, no id.
+    try testing.expectEqual(
+        @as(?u64, null),
+        subprocess.getProcessInfo(.foreground_pid),
+    );
+
+    _ = try subprocess.start(testing.allocator);
+
+    const cmd = subprocess.process.?.fork_exec;
+    const foreground_pid = subprocess.getProcessInfo(.foreground_pid) orelse
+        return error.ForegroundPidUnavailable;
+    try testing.expect(foreground_pid != 0);
+    // It is the shell's own process id, as the kernel reports it for the
+    // process handle Command keeps.
+    try testing.expectEqual(
+        @as(u64, windows.exp.kernel32.GetProcessId(cmd.pid.?)),
+        foreground_pid,
+    );
+    try testing.expectEqual(@as(u64, cmd.windows_process_id.?), foreground_pid);
 }
 
 test "io-gather exits on persistent EOF readiness" {

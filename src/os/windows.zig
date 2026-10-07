@@ -248,6 +248,9 @@ pub const exp = struct {
             hProcess: HANDLE,
             lpExitCode: *DWORD,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn GetProcessId(
+            Process: HANDLE,
+        ) callconv(.winapi) DWORD;
         pub extern "kernel32" fn TerminateProcess(
             hProcess: HANDLE,
             uExitCode: UINT,
