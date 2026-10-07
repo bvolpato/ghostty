@@ -36,13 +36,16 @@ jobs:
           echo "/tmp/zig-${arch}-macos-${version}" >> "$GITHUB_PATH"
           "/tmp/zig-${arch}-macos-${version}/zig" version
 
-      # cmux's build-ghosttykit.yml runs `zig build test` (i18n on) first, so
-      # every lazy dependency, libintl included, is already fetched when the
-      # -Di18n=false xcframework builds. A fresh checkout leaves the lazy
-      # libintl path dependency unresolved and hides the bug, so resolve them
-      # with a default (i18n on) configure pass first.
-      - name: Resolve lazy dependencies with i18n on (as cmux's build does)
-        run: zig build -l > /dev/null
+      # cmux's GhosttyKit build restores ~/.cache/zig, which holds the gettext
+      # tarball, so pkg/libintl compiles the full libintl. On a fresh runner the
+      # lazy gettext dependency is unfetched, pkg/libintl builds an empty
+      # archive and the bug is hidden. Fetch it the way cmux's cache has it.
+      - name: Fetch gettext into the Zig cache (as cmux's cache has it)
+        run: |
+          set -euo pipefail
+          url="$(awk -F '"' '/\.url = .*gettext/ { print $2; exit }' pkg/libintl/build.zig.zon)"
+          echo "fetching $url"
+          zig fetch "$url"
 
       # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
       - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
