@@ -1208,7 +1208,15 @@ const Subprocess = struct {
         const pty = &(self.pty orelse return null);
         const raw = pty.getProcessInfo(.foreground_pid) orelse return null;
         const pgid = std.math.cast(c.pid_t, raw) orelse return null;
-        return if (pgid > 0) pgid else null;
+        return if (isSignallableProcessGroup(pgid)) pgid else null;
+    }
+
+    /// killpg(0) and killpg of the caller's own group both signal the
+    /// process running this teardown (and its parent shell or test runner),
+    /// never the terminal's jobs. A PTY whose session leader has exited
+    /// reports a foreground group of 0 on Linux, so this is reachable.
+    fn isSignallableProcessGroup(pgid: c.pid_t) bool {
+        return pgid > 0 and pgid != c.getpgrp();
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
@@ -1332,13 +1340,24 @@ const Subprocess = struct {
         direct_child_pid: ?c.pid_t,
         timeouts: KillTimeouts,
     ) !void {
+        if (!isSignallableProcessGroup(primary_pgid)) {
+            log.warn(
+                "refusing to signal unsafe process group pgid={}",
+                .{primary_pgid},
+            );
+            return error.UnsafeProcessGroup;
+        }
+
         // `Pty.childPreExec` calls setsid before exec, so the direct child pid
         // is the process-group id. Unlike getpgid(pid), that identity remains
         // valid after the leader exits while descendants retain the group. Job
         // control may move the terminal's foreground process into a distinct
         // group, so both groups share one graceful and forced-shutdown budget.
         const distinct_foreground_pgid = if (foreground_pgid) |pgid|
-            if (pgid != primary_pgid) pgid else null
+            if (pgid != primary_pgid and isSignallableProcessGroup(pgid))
+                pgid
+            else
+                null
         else
             null;
         const group_ids: [2]?c.pid_t = .{
@@ -3023,18 +3042,28 @@ test "subprocess stop kills a distinct foreground process group" {
         if (posix.system.read(job_ready_pipe[0], &job_ready, 1) != 1) c._exit(1);
         if (c.tcsetpgrp(pty.slave, @intCast(job_pid)) < 0) c._exit(1);
         if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
-        c._exit(0);
+
+        // Stay alive as the session leader, like a shell running a
+        // foreground job. If the leader exits, the kernel disassociates the
+        // controlling terminal and the PTY stops reporting the job's group.
+        // Reap the job so its group disappears once it is killed.
+        var job_status: c_int = 0;
+        _ = posix.system.waitpid(@intCast(job_pid), &job_status, 0);
+        while (true) _ = c.pause();
     }
 
-    var leader_reaped = false;
     var foreground_pgid: ?c.pid_t = null;
     defer {
-        if (foreground_pgid) |pgid| _ = c.killpg(pgid, c.SIGKILL);
-        _ = c.killpg(leader_pid, c.SIGKILL);
-        if (!leader_reaped) {
-            var status: c_int = 0;
-            _ = posix.system.waitpid(leader_pid, &status, 0);
+        // Never killpg a group of 0 or the runner's own group: both
+        // signal the test runner itself.
+        if (foreground_pgid) |pgid| {
+            if (pgid > 0 and pgid != c.getpgrp()) _ = c.killpg(pgid, c.SIGKILL);
         }
+        // The leader is never reaped before this point, so its pid and
+        // process group cannot have been recycled.
+        _ = c.killpg(leader_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(leader_pid, &status, 0);
     }
 
     _ = posix.system.close(ready_pipe[1]);
@@ -3042,18 +3071,14 @@ test "subprocess stop kills a distinct foreground process group" {
     try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
     _ = posix.system.close(pty.slave);
 
-    var leader_status: c_int = 0;
-    try testing.expectEqual(
-        leader_pid,
-        @as(posix.pid_t, @intCast(posix.system.waitpid(leader_pid, &leader_status, 0))),
-    );
-    leader_reaped = true;
-
-    foreground_pgid = @intCast(
+    foreground_pgid = std.math.cast(
+        c.pid_t,
         pty.getProcessInfo(.foreground_pid) orelse
             return error.ForegroundProcessGroupUnavailable,
-    );
+    ) orelse return error.ForegroundProcessGroupUnavailable;
+    try testing.expect(foreground_pgid.? > 0);
     try testing.expect(foreground_pgid.? != leader_pid);
+    try testing.expect(foreground_pgid.? != c.getpgrp());
 
     var arena = ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -3080,6 +3105,74 @@ test "subprocess stop kills a distinct foreground process group" {
     const foreground_probe_err = posix.errno(foreground_probe);
     try testing.expectEqual(@as(c_int, -1), foreground_probe);
     try testing.expectEqual(posix.E.SRCH, foreground_probe_err);
+}
+
+test "subprocess stop never signals the caller's own process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    // Open the pty before forking: openpty is not async-signal-safe.
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    // Teardown must never signal the process group that runs it. Run the
+    // check in a forked child that owns a fresh session whose controlling
+    // terminal reports the child's own group as foreground. A regression then
+    // kills only that child, never the test runner's process group.
+    const child_pid: posix.pid_t = child: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :child @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (child_pid == 0) {
+        if (c.setsid() < 0) c._exit(10);
+        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(12);
+        const own_pgid = c.getpgrp();
+        const foreground = pty.getProcessInfo(.foreground_pid) orelse c._exit(13);
+        if (foreground != @as(u64, @intCast(own_pgid))) c._exit(14);
+
+        var subprocess: Subprocess = .{
+            .arena = ArenaAllocator.init(std.heap.page_allocator),
+            .cwd = null,
+            .env = null,
+            .args = &.{},
+            .grid_size = .{},
+            .screen_size = .{ .width = 1, .height = 1 },
+            .pty = pty,
+            .process = null,
+            .process_group_id = own_pgid,
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        };
+        if (subprocess.foregroundProcessGroupId() != null) c._exit(15);
+        subprocess.stopWithTimeouts(.{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        });
+
+        if (Subprocess.killProcessGroupWithTimeouts(own_pgid, null, .{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        })) |_| c._exit(16) else |_| {}
+        c._exit(0);
+    }
+
+    var status: c_int = 0;
+    try testing.expectEqual(
+        child_pid,
+        @as(posix.pid_t, @intCast(posix.system.waitpid(child_pid, &status, 0))),
+    );
+    // A signal death here means teardown signalled its own process group.
+    const exit_status: u32 = @bitCast(status);
+    try testing.expect(!posix.W.IFSIGNALED(exit_status));
+    try testing.expect(posix.W.IFEXITED(exit_status));
+    try testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(exit_status));
 }
 
 /// Builds the argv array for the process we should exec for the
