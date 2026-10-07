@@ -1341,7 +1341,7 @@ const Subprocess = struct {
         timeouts: KillTimeouts,
     ) !void {
         if (!isSignallableProcessGroup(primary_pgid)) {
-            log.err(
+            log.warn(
                 "refusing to signal unsafe process group pgid={}",
                 .{primary_pgid},
             );
