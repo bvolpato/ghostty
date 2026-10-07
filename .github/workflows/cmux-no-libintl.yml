@@ -39,9 +39,10 @@ jobs:
       # cmux's build-ghosttykit.yml runs `zig build test` (i18n on) first, so
       # every lazy dependency, libintl included, is already fetched when the
       # -Di18n=false xcframework builds. A fresh checkout leaves the lazy
-      # libintl path dependency unresolved and hides the bug, so fetch all.
-      - name: Fetch all dependencies (as cmux's build has them)
-        run: zig build --fetch=all
+      # libintl path dependency unresolved and hides the bug, so resolve them
+      # with a default (i18n on) configure pass first.
+      - name: Resolve lazy dependencies with i18n on (as cmux's build does)
+        run: zig build -l > /dev/null
 
       # Same flags as cmux's .github/workflows/build-ghosttykit.yml.
       - name: Build GhosttyKit xcframework (universal, -Di18n=false, as cmux)
