@@ -52,8 +52,9 @@ jobs:
       - name: Build ghostty CLI (-Di18n=false, as cmux's helper)
         run: |
           set -euo pipefail
-          zig build \
+          zig build cli-helper \
             -Dapp-runtime=none \
+            -Dcrash-report-subdir=cmux/crash \
             -Di18n=false \
             -Demit-macos-app=false \
             -Demit-xcframework=false \
@@ -65,4 +66,4 @@ jobs:
           set -euo pipefail
           paths=(zig-out-cli macos/GhosttyKit.xcframework)
           find "${paths[@]}" -type f \( -name '*.a' -o -perm -u+x \) -print -exec file -b {} \;
-          .github/scripts/check-no-libintl.sh "${paths[@]}"
+          python3 .github/scripts/check_no_libintl.py "${paths[@]}"
