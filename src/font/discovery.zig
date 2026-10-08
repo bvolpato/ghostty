@@ -5,7 +5,8 @@ const assert = @import("../quirks.zig").inlineAssert;
 const fontconfig = @import("fontconfig");
 const macos = @import("macos");
 const opentype = @import("opentype.zig");
-const options = @import("main.zig").options;
+const main_font = @import("main.zig");
+const options = main_font.options;
 const Collection = @import("main.zig").Collection;
 const DeferredFace = @import("main.zig").DeferredFace;
 const Face = @import("main.zig").Face;
@@ -1243,6 +1244,48 @@ test "coretext codepoint" {
 
     // Should have other codepoints too
     try testing.expect(face.hasCodepoint('B', null));
+}
+
+test "coretext CJK fallback keeps the direct codepoint result" {
+    if (options.backend != .coretext and options.backend != .coretext_freetype)
+        return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var collection = Collection.init();
+    defer collection.deinit(alloc);
+    const size: main_font.face.DesiredSize = .{ .points = 12 };
+    collection.load_options = .{ .library = lib, .size = size };
+    _ = try collection.add(alloc, try Face.init(
+        lib,
+        @import("main.zig").embedded.regular,
+        .{ .size = size },
+    ), .{
+        .style = .regular,
+        .fallback = false,
+        .size_adjustment = .none,
+    });
+
+    var ct = CoreText.init(lib);
+    defer ct.deinit();
+
+    // Japanese kana is covered by CoreText's direct fallback selection. The
+    // fallback iterator should avoid a full font-collection scan and return
+    // that resolved face directly.
+    var it = try ct.discoverFallback(alloc, &collection, .{
+        .codepoint = 0x3042,
+        .size = size.points,
+    });
+    defer it.deinit();
+
+    try testing.expectEqual(@as(usize, 1), it.list.len);
+    var face = (try it.next()).?;
+    defer face.deinit();
+    try testing.expect(face.hasCodepoint(0x3042, null));
 }
 
 test "coretext sorting" {
