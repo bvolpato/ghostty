@@ -351,6 +351,18 @@ pub const CoreText = struct {
         _ = self;
     }
 
+    /// CoreText already knows the locale-aware fallback for CJK codepoints.
+    /// Keep these lookups on that path instead of rebuilding and scoring the
+    /// complete system font collection for every missing glyph.
+    fn usesCodepointFallback(cp: u32) bool {
+        return (cp >= 0x3000 and cp <= 0x30FF) or // CJK punctuation and kana
+            (cp >= 0x31F0 and cp <= 0x31FF) or // Katakana phonetic extensions
+            (cp >= 0x3400 and cp <= 0x4DBF) or // CJK unified ideographs ext. A
+            (cp >= 0x4E00 and cp <= 0x9FFF) or // CJK unified ideographs
+            (cp >= 0xF900 and cp <= 0xFAFF) or // CJK compatibility ideographs
+            (cp >= 0xFF00 and cp <= 0xFFEF); // fullwidth forms and halfwidth kana
+    }
+
     /// Discover fonts from a descriptor. This returns an iterator that can
     /// be used to build up the deferred fonts.
     pub fn discover(self: *const CoreText, alloc: Allocator, desc: Descriptor) !DiscoverIterator {
@@ -390,28 +402,25 @@ pub const CoreText = struct {
         collection: *Collection,
         desc: Descriptor,
     ) !DiscoverIterator {
-        // If we have a codepoint within the CJK unified ideographs block
-        // then we fallback to macOS to find a font that supports it because
-        // there isn't a better way manually with CoreText that I can find that
-        // properly takes into account system locale.
+        // CoreText's direct fallback lookup accounts for the user's system
+        // locale and is much cheaper than enumerating every installed font.
+        // This covers the CJK scripts where locale-sensitive fallback matters.
         //
         // References:
         // - http://unicode.org/charts/PDF/U4E00.pdf
         // - https://chromium.googlesource.com/chromium/src/+/main/third_party/blink/renderer/platform/fonts/LocaleInFonts.md#unified-han-ideographs
-        if (desc.codepoint >= 0x4E00 and
-            desc.codepoint <= 0x9FFF)
-        han: {
-            const han = try self.discoverCodepoint(
+        if (usesCodepointFallback(desc.codepoint)) direct: {
+            const direct = try self.discoverCodepoint(
                 collection,
                 desc,
-            ) orelse break :han;
+            ) orelse break :direct;
 
             // This is silly but our discover iterator needs a slice so
             // we allocate here. This isn't a performance bottleneck but
             // this is something we can optimize very easily...
             const list = try alloc.alloc(*macos.text.FontDescriptor, 1);
             errdefer alloc.free(list);
-            list[0] = han;
+            list[0] = direct;
 
             return DiscoverIterator{
                 .alloc = alloc,
