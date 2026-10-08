@@ -1256,7 +1256,9 @@ test "coretext codepoint" {
 }
 
 test "coretext CJK fallback keeps the direct codepoint result" {
-    if (options.backend != .coretext and options.backend != .coretext_freetype)
+    // The direct lookup is only available to CoreText renderers that do not
+    // use FreeType; the CoreText+FreeType backend intentionally returns null.
+    if (!options.backend.hasCoretext() or options.backend.hasFreetype())
         return error.SkipZigTest;
 
     const testing = std.testing;
