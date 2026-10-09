@@ -439,6 +439,7 @@ pub const Action = union(Key) {
     };
 
     pub const ProgramStatus = struct {
+        const Self = @This();
         pub const Event = enum(c_int) { report, prompt_start };
         pub const State = enum(c_int) { idle, working, done, blocked, @"error", clear };
         pub const Kind = enum(c_int) { none, permission, question, auth };
@@ -463,9 +464,7 @@ pub const Action = union(Key) {
             msg: ?[*:0]const u8,
         };
 
-        const CValue = C;
-
-        pub fn cval(self: @This()) CValue {
+        pub fn cval(self: Self) Self.C {
             return .{
                 .event = self.event,
                 .state = self.state,
