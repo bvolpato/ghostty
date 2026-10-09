@@ -308,6 +308,15 @@ fn validate(data: []const u8) error{
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = std.mem.trim(u8, pair[0..eq], &std.ascii.whitespace);
         if (key.len > max_key_bytes) return error.TooLong;
+        const value = std.mem.trim(u8, pair[eq + 1 ..], &std.ascii.whitespace);
+        if (std.mem.eql(u8, key, "id")) try validateId(value);
+        inline for (.{
+            .{ "app", max_app_bytes },
+            .{ "title", max_title_encoded_bytes },
+            .{ "msg", max_msg_encoded_bytes },
+        }) |limit| {
+            if (std.mem.eql(u8, key, limit[0]) and value.len > limit[1]) return error.TooLong;
+        }
     }
 
     // Every value is checked against its limit, even one a later pair
@@ -324,10 +333,12 @@ fn validate(data: []const u8) error{
     }
 
     var buf: [max_msg_bytes]u8 = undefined;
-    if (lastValue("title", data)) |v| {
-        if ((try decodeText(v, &buf)).len > max_title_bytes) return error.TooLong;
+    var titles: kitty_metadata.ValueIterator("title", value_bytes) = .init(data);
+    while (titles.next()) |value| {
+        if ((try decodeText(value, &buf)).len > max_title_bytes) return error.TooLong;
     }
-    if (lastValue("msg", data)) |v| _ = try decodeText(v, &buf);
+    var messages: kitty_metadata.ValueIterator("msg", value_bytes) = .init(data);
+    while (messages.next()) |value| _ = try decodeText(value, &buf);
 
     // An unknown state discards the report rather than guessing, so a
     // state added in a later revision never turns into something else.
