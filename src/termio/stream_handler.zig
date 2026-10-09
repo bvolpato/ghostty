@@ -1790,12 +1790,13 @@ pub const StreamHandler = struct {
         if (report.readOption(.app)) |value| status.app = apprt.surface.Message.WriteReq.init(self.alloc, value) catch return;
 
         inline for (.{ terminal.osc.Command.ProgramStatus.Option.title, terminal.osc.Command.ProgramStatus.Option.msg }) |option| {
-            if (report.readOption(option) == null) continue;
-            var writer: std.Io.Writer.Allocating = .init(self.alloc);
-            defer writer.deinit();
-            report.writeText(option, &writer.writer) catch return;
-            const value = apprt.surface.Message.WriteReq.init(self.alloc, writer.writer.buffered()) catch return;
-            if (option == .title) status.title = value else status.msg = value;
+            if (report.readOption(option) != null) {
+                var writer: std.Io.Writer.Allocating = .init(self.alloc);
+                defer writer.deinit();
+                report.writeText(option, &writer.writer) catch return;
+                const value = apprt.surface.Message.WriteReq.init(self.alloc, writer.writer.buffered()) catch return;
+                if (option == .title) status.title = value else status.msg = value;
+            }
         }
 
         self.surfaceMessageWriter(.{ .program_status = status });

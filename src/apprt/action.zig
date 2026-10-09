@@ -514,7 +514,7 @@ pub const Action = union(Key) {
         // so we can change this but I want to be aware of it.
         assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
             4 => 32,
-            8 => 64,
+            8 => 48,
             else => unreachable,
         });
     }
