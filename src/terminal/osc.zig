@@ -778,6 +778,11 @@ pub const Parser = struct {
         }
     }
 
+    /// Feed a byte slice into the streaming parser.
+    pub fn nextSlice(self: *Parser, bytes: []const u8) void {
+        for (bytes) |byte| self.next(byte);
+    }
+
     /// End the sequence and return the command, if any. If the return value
     /// is null, then no valid command was found. The optional terminator_ch
     /// is the final character in the OSC sequence. This is used to determine
