@@ -1122,6 +1122,41 @@ typedef struct {
   int8_t progress;
 } ghostty_action_progress_report_s;
 
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_EVENT_REPORT,
+  GHOSTTY_PROGRAM_STATUS_EVENT_PROMPT_START,
+} ghostty_program_status_event_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_IDLE,
+  GHOSTTY_PROGRAM_STATUS_WORKING,
+  GHOSTTY_PROGRAM_STATUS_DONE,
+  GHOSTTY_PROGRAM_STATUS_BLOCKED,
+  GHOSTTY_PROGRAM_STATUS_ERROR,
+  GHOSTTY_PROGRAM_STATUS_CLEAR,
+} ghostty_program_status_state_e;
+
+typedef enum {
+  GHOSTTY_PROGRAM_STATUS_KIND_NONE,
+  GHOSTTY_PROGRAM_STATUS_KIND_PERMISSION,
+  GHOSTTY_PROGRAM_STATUS_KIND_QUESTION,
+  GHOSTTY_PROGRAM_STATUS_KIND_AUTH,
+} ghostty_program_status_kind_e;
+
+// apprt.Action.ProgramStatus.C
+// String pointers are borrowed and valid only for the duration of the action
+// callback. They are NUL-terminated when non-NULL.
+typedef struct {
+  ghostty_program_status_event_e event;
+  ghostty_program_status_state_e state;
+  ghostty_program_status_kind_e kind;
+  int8_t progress;
+  const char* id;
+  const char* app;
+  const char* title;
+  const char* msg;
+} ghostty_action_program_status_s;
+
 // apprt.action.CommandFinished.C
 typedef struct {
   // -1 if no exit code was reported, otherwise 0-255
@@ -1221,6 +1256,7 @@ typedef enum {
   GHOSTTY_ACTION_READONLY,
   GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD,
   GHOSTTY_ACTION_SELECTION_CHANGED,
+  GHOSTTY_ACTION_PROGRAM_STATUS,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1262,6 +1298,7 @@ typedef union {
   ghostty_action_search_total_s search_total;
   ghostty_action_search_selected_s search_selected;
   ghostty_action_readonly_e readonly;
+  ghostty_action_program_status_s program_status;
 } ghostty_action_u;
 
 typedef struct {

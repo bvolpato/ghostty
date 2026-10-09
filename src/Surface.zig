@@ -1462,6 +1462,54 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .program_status => |v| {
+            defer v.deinit();
+            var id_buf: [129]u8 = undefined;
+            var app_buf: [33]u8 = undefined;
+            var title_buf: [193]u8 = undefined;
+            var msg_buf: [2049]u8 = undefined;
+            const copyCString = struct {
+                fn run(req: ?Message.WriteReq, buf: []u8) ?[]const u8 {
+                    const value = req orelse return null;
+                    const data = value.slice();
+                    if (data.len + 1 > buf.len) return null;
+                    @memcpy(buf[0..data.len], data);
+                    buf[data.len] = 0;
+                    return buf[0..data.len];
+                }
+            }.run;
+            const state: apprt.Action.ProgramStatus.State = switch (v.state) {
+                .idle => .idle,
+                .working => .working,
+                .done => .done,
+                .blocked => .blocked,
+                .@"error" => .@"error",
+                .clear => .clear,
+            };
+            const kind: apprt.Action.ProgramStatus.Kind = if (v.kind) |value| switch (value) {
+                .permission => .permission,
+                .question => .question,
+                .auth => .auth,
+            } else .none;
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .program_status,
+                .{
+                    .event = switch (v.event) {
+                        .report => .report,
+                        .prompt_start => .prompt_start,
+                    },
+                    .state = state,
+                    .kind = kind,
+                    .progress = if (v.progress) |percent| @intCast(percent) else -1,
+                    .id = copyCString(v.id, &id_buf),
+                    .app = copyCString(v.app, &app_buf),
+                    .title = copyCString(v.title, &title_buf),
+                    .msg = copyCString(v.msg, &msg_buf),
+                },
+            ) catch |err| log.warn("apprt failed to report program status err={}", .{err});
+        },
+
         .tmux_control => |v| {
             defer v.data.deinit();
             if (comptime @hasDecl(apprt.runtime.Surface, "tmuxControl")) {
